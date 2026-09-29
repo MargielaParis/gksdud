@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 
+#if TESTS
 // Preserve an actionable failure location in optimized CI builds, where Swift's
 // precondition trap otherwise loses its message and buffered stdout.
 func featureCheck(_ condition: @autoclosure () -> Bool, _ message: String = "", file: StaticString = #filePath, line: UInt = #line) {
@@ -59,6 +60,106 @@ func runFeatureTests() {
     runOptionInputTests()
     runOptionRepeatTests()
     runNativeOptionSymbolTests()
+    runEnglishSwitchTests()
+}
+
+func runEnglishSwitchTests() {
+    func escape(_ type: CGEventType, _ language: String, _ flags: CGEventFlags = [], repeated: Bool = false, code: Int = kVK_Escape,
+                upper: Bool = false, switchingFrom: String? = nil) -> Bool {
+        plainEscape(type: type, code: Int64(code), flags: flags, repeated: repeated)
+            && escapeNeedsEnglish(language: language, upper: flags.contains(.maskAlphaShift) || upper, switching: language == switchingFrom)
+    }
+    featureCheck(escape(.keyDown, "ko"), "ESC in Korean ends in English lowercase")
+    featureCheck(escape(.keyDown, "en", .maskAlphaShift), "ESC in English uppercase turns Caps Lock off")
+    featureCheck(!escape(.keyDown, "en"), "ESC in English lowercase changes nothing")
+    featureCheck(escape(.keyDown, "en", upper: true), "ESC before the remembered uppercase is restored still ends lowercase")
+    featureCheck(escape(.keyDown, "en", switchingFrom: "en") && !escape(.keyDown, "en", switchingFrom: "ko"),
+        "ESC right after a switch away from English comes back")
+    featureCheck(!escape(.keyDown, "ja") && !escape(.keyDown, "ja", .maskAlphaShift) && !escape(.keyDown, "")
+        && !escape(.keyDown, "ja", upper: true, switchingFrom: "ja"), "Other input sources stay; the switch key would only return to the previous one")
+    featureCheck(!escape(.keyDown, "ko", repeated: true), "Held ESC switches once")
+    let sent = SentSwitch(from: "ko", at: 10)
+    featureCheck(sent.inFlight(now: 10.1, language: "ko"), "A Korean/English key just before ESC is still on its way")
+    featureCheck(!sent.inFlight(now: 10.1, language: "en"), "Once the source changed, ESC needs no pulse of its own")
+    featureCheck(!sent.inFlight(now: 10.5, language: "ko"), "A pulse macOS ignored does not block later switches")
+    featureCheck(englishRoute(from: "en", switching: false) == .now && englishRoute(from: "ko", switching: false) == .sendSwitch,
+        "English completes at once; Korean sends a switch")
+    featureCheck(englishRoute(from: "ko", switching: true) == .awaitSwitch, "A switch on its way from Korean reaches English by itself")
+    featureCheck(englishRoute(from: "en", switching: true) == .sendSwitch, "A switch on its way from English needs another to come back")
+    func switchKey(down: Bool, repeated: Bool = false, onPress: Bool, longPress: Bool) -> [Bool] {
+        let result = switchKeyEvent(down: down, repeated: repeated, onPress: onPress, longPress: longPress)
+        return [result.begins, result.sent]
+    }
+    for longPress in [false, true] {
+        featureCheck(switchKey(down: true, onPress: true, longPress: longPress) == [true, true], "Switching on press sends a pulse")
+        featureCheck(switchKey(down: true, repeated: true, onPress: true, longPress: longPress) == [false, false])
+        featureCheck(switchKey(down: false, onPress: true, longPress: longPress) == [false, false])
+    }
+    featureCheck(switchKey(down: true, onPress: false, longPress: false) == [true, true] && switchKey(down: false, onPress: false, longPress: false) == [true, true],
+        "The native shortcut switches on this press's release")
+    featureCheck(switchKey(down: true, onPress: false, longPress: true) == [true, false] && switchKey(down: false, onPress: false, longPress: true) == [false, false],
+        "A hold that switches on a short release has sent nothing while held, so ESC sends its own")
+    featureCheck(!escape(.keyUp, "ko"))
+    featureCheck(!escape(.flagsChanged, "ko", .maskAlphaShift, code: kVK_CapsLock) && !escape(.keyDown, "ko", code: kVK_ANSI_A))
+    for modifier: CGEventFlags in [.maskCommand, .maskControl, .maskAlternate, .maskShift] {
+        featureCheck(!escape(.keyDown, "ko", modifier), "Modified ESC stays a shortcut")
+    }
+    for initial in [false, true] {
+        for korean in [false, true] {
+            var caps = EnglishCapsState()
+            caps.enable(actual: initial)
+            caps.willSwitch(english: true, actual: initial, longPress: false); caps.switching = false
+            caps.capsKeyChanged(english: false, actual: !initial, korean: korean)
+            caps.willSwitch(english: false, actual: !initial, longPress: false)
+            featureCheck(caps.target(english: true) == (korean ? !initial : initial),
+                "Caps Lock pressed in Korean sets the English case only with Caps Lock in Korean on")
+        }
+    }
+    var caps = EnglishCapsState()
+    caps.enable(actual: false)
+    caps.willSwitch(english: true, actual: false, longPress: false)
+    caps.capsKeyChanged(english: false, actual: true, korean: true)
+    featureCheck(caps.target(english: true) == false, "A Caps Lock change during a switch is still ignored")
+    var into = EnglishCapsState()
+    into.enable(actual: false)
+    into.willSwitch(english: false, actual: false, longPress: false)
+    into.capsKeyChanged(english: true, actual: true)
+    featureCheck(into.target(english: true) == true, "A Caps Lock press on the way into English is the user's; only Korean turns the lock off")
+    into.switching = false
+    into.willSwitch(english: true, actual: true, longPress: false)
+    into.capsKeyChanged(english: true, actual: false)
+    featureCheck(into.target(english: true) == true, "A reset on the way into Korean is still ignored")
+    into.switching = false; into.switching = true
+    into.capsKeyChanged(english: true, actual: false)
+    featureCheck(into.target(english: true) == true, "A switch it did not see start is not taken for one into English")
+
+    let suite = "io.gksdud.english-switch-tests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let keyboard = TestKeyboard("english-switch-1", name: "Keyboard", serial: "english-switch")
+    let engine = Engine(defaults: defaults, discover: { [keyboard] })
+    _ = engine.keyboards.reconcile(sources: engine.defaultSources, target: f19, active: true)
+    featureCheck(!engine.koreanCapsLock && !engine.escapeToEnglish, "Both keys are opt-in")
+    featureCheck(!engine.capsLockSwitches())
+    engine.defaultSources = [sources[0], sources[2]]
+    featureCheck(engine.capsLockSwitches(), "Caps Lock among default Korean/English keys")
+    featureCheck(!engine.capsLockSwitches([sources[0]]) && engine.capsLockSwitches([sources[3], sources[2]]), "Checks keys before saving them")
+    engine.keyboards.setSources([sources[2]], for: keyboard.identity.key)
+    engine.defaultSources = [sources[0]]
+    featureCheck(engine.capsLockSwitches(), "Caps Lock as one keyboard's own key")
+    engine.keyboards.setMode(.off, for: keyboard.identity.key)
+    featureCheck(!engine.capsLockSwitches(), "Keyboards left off do not count")
+    engine.defaultSources = [sources[2]]
+    featureCheck(engine.capsLockSwitches(), "New keyboards follow the default")
+    engine.keyboards.defaultEnabled = false
+    featureCheck(!engine.capsLockSwitches())
+    engine.keyboards.setMode(.on, for: keyboard.identity.key); engine.keyboards.setSources(nil, for: keyboard.identity.key)
+    featureCheck(engine.capsLockSwitches(), "An enabled keyboard following the default")
+    defaults.set(true, forKey: "koreanCapsLock")
+    featureCheck(!engine.koreanCapsLock, "Caps Lock in Korean waits while Caps Lock is a Korean/English key, however it was saved")
+    engine.keyboards.setMode(.off, for: keyboard.identity.key)
+    featureCheck(engine.koreanCapsLock, "and comes back once it is not")
+    print("PASS: ESC to English lowercase from Korean only, modifier and repeat exclusions, a remembered uppercase, a switch already on its way from either source, held switch keys, Caps Lock in Korean setting the English case, Caps Lock key conflicts")
 }
 
 func runOptionInputTests() {
@@ -382,6 +483,143 @@ func probeOptionInput() throws {
     guard passed == total else { throw NSError(domain: "probe", code: 3, userInfo: [NSLocalizedDescriptionKey: "Native input expectations failed."]) }
 }
 
+// Drives the running gksdud with HID-level keys from a second instance, then reads the input source and the Caps Lock lock.
+// Launch the test app from build.sh, signed like the installed one, so it has gksdud's Accessibility permission:
+// open -n -W --stdout <file> <test app> --args --probe-escape
+// It needs ESC to English on in the running app. Keys go only while this probe's window is frontmost.
+// A physical Caps Lock press cannot be generated: posted Caps Lock events do not toggle the lock.
+func probeEscape() throws {
+    func failure(_ code: Int, _ message: String) -> NSError { NSError(domain: "probe", code: code, userInfo: [NSLocalizedDescriptionKey: message]) }
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular); app.finishLaunching()
+    guard AXIsProcessTrusted() else { throw failure(1, "Launch the gksdud bundle with open -n so the probe has its accessibility permission.") }
+    // The running app's settings, read only.
+    let saved = UserDefaults.standard
+    let target = targets.first { $0.name == saved.string(forKey: "target") } ?? targets[6]
+    guard NSRunningApplication.runningApplications(withBundleIdentifier: "io.gksdud.inputswitch").contains(where: { $0.processIdentifier != getpid() }),
+          saved.object(forKey: "active") == nil || saved.bool(forKey: "active"), saved.bool(forKey: "escapeToEnglish") else {
+        throw failure(2, "Run gksdud with ESC to English turned on first.")
+    }
+    let suite = "io.gksdud.escape-probe.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    let delegate = AppDelegate(engine: Engine(defaults: defaults, discover: { [] }))
+    guard let korean = delegate.availableSource("ko"), let english = delegate.availableSource("en") else {
+        defaults.removePersistentDomain(forName: suite); throw failure(3, "Korean and English input sources are required.")
+    }
+    func lock() -> Bool {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        defer { IOObjectRelease(service) }
+        var connection: io_connect_t = 0, state = false
+        guard IOServiceOpen(service, mach_task_self_, UInt32(kIOHIDParamConnectType), &connection) == KERN_SUCCESS else { return false }
+        defer { IOServiceClose(connection) }
+        IOHIDGetModifierLockState(connection, Int32(kIOHIDCapsLockState), &state)
+        return state
+    }
+    // ESC in a text view would open completions, so ESC cases send it to a plain view.
+    final class KeySink: NSView {
+        override var acceptsFirstResponder: Bool { true }
+        override func keyDown(with event: NSEvent) {}
+    }
+    let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
+    panel.title = "gksdud ESC 실험"
+    let text = NSTextView(frame: NSRect(x: 10, y: 10, width: 400, height: 100)), sink = KeySink(frame: .zero)
+    text.font = .systemFont(ofSize: 24); panel.contentView!.addSubview(text); panel.contentView!.addSubview(sink)
+    let previousApp = NSWorkspace.shared.frontmostApplication
+    let savedSource = TISCopyCurrentKeyboardInputSource()!.takeRetainedValue()
+    // The English case the running app remembers shows in English once it has restored it.
+    _ = TISSelectInputSource(english); RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.6))
+    let englishCase = lock()
+    defer {
+        // The running app ignores software lock changes, and a posted Caps Lock event does not toggle the lock. So the lock
+        // is set directly, and a Caps Lock event only its tap reads sets the case it remembers.
+        _ = TISSelectInputSource(english); RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.6))
+        try? setCapsLock(englishCase)
+        if let caps = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_CapsLock), keyDown: true) {
+            caps.type = .flagsChanged; caps.flags = englishCase ? .maskAlphaShift : []; caps.post(tap: .cghidEventTap)
+        }
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.2))
+        _ = TISSelectInputSource(savedSource); RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.6))
+        panel.orderOut(nil); previousApp?.activate(options: [])
+        defaults.removePersistentDomain(forName: suite)
+    }
+    func pump(_ duration: TimeInterval) {
+        let end = Date(timeIntervalSinceNow: duration)
+        while Date() < end {
+            if let event = app.nextEvent(matching: .any, until: Date(timeIntervalSinceNow: 0.005), inMode: .default, dequeue: true) { app.sendEvent(event) }
+        }
+    }
+    func frontmost() -> Bool { panel.isKeyWindow && NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid() }
+    // Through the HID stream, so the running gksdud's tap and the system shortcut see it. Posted flags also become the
+    // session's flags, so they carry the Caps Lock lock.
+    func post(_ code: Int, hold: TimeInterval = 0) throws {
+        guard frontmost() else { throw failure(4, "The probe window lost focus; no more keys were sent.") }
+        for down in [true, false] {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: down)!
+            if lock() { event.flags.insert(.maskAlphaShift) }
+            event.post(tap: .cghidEventTap)
+            if down && hold > 0 { pump(hold) }
+        }
+    }
+    // Waits out the running app's Caps Lock checks after the source change before setting the lock.
+    func prepare(_ source: TISInputSource, caps: Bool, responder: NSResponder) throws {
+        panel.makeKeyAndOrderFront(nil); panel.makeFirstResponder(responder); app.activate(ignoringOtherApps: true)
+        _ = TISSelectInputSource(source); pump(0.6)
+        // setCapsLock's immediate readback can lag here; the lock is checked below after a pause.
+        try? setCapsLock(caps); pump(0.2)
+        guard frontmost(), delegate.currentLanguage == delegate.language(source), lock() == caps else {
+            throw failure(5, "Could not prepare \(delegate.language(source)) with Caps Lock \(caps ? "on" : "off").")
+        }
+    }
+    var passed = 0, total = 0
+    func expect(_ name: String, _ language: String, caps: Bool) {
+        let actual = delegate.currentLanguage, actualCaps = lock()
+        let ok = actual.hasPrefix(language) && actualCaps == caps
+        total += 1; if ok { passed += 1 }
+        print("PROBE \(ok ? "PASS" : "FAIL"): \(name), expected=\(language) Caps Lock \(caps), actual=\(actual) Caps Lock \(actualCaps)")
+    }
+    try prepare(korean, caps: false, responder: sink)
+    try post(kVK_Escape); pump(0.8)
+    expect("ESC in Korean", "en", caps: false)
+    try prepare(english, caps: true, responder: sink)
+    try post(kVK_Escape); pump(0.8)
+    expect("ESC in English uppercase", "en", caps: false)
+    // The switch key's pulse is still on its way when ESC arrives; a second pulse would return to Korean.
+    try prepare(korean, caps: false, responder: sink)
+    try post(target.keyCode); try post(kVK_Escape); pump(0.8)
+    expect("Korean/English key right before ESC", "en", caps: false)
+    // 2-Set Korean types Hangul whatever the lock, so showing the English case in Korean is safe.
+    try prepare(korean, caps: true, responder: text)
+    text.string = ""
+    for down in [true, false] {
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_ANSI_R), keyDown: down)!
+        event.flags = .maskAlphaShift; event.postToPid(getpid())
+    }
+    pump(0.3); text.unmarkText()
+    total += 1; if text.string == "ㄱ" { passed += 1 }
+    print("PROBE \(text.string == "ㄱ" ? "PASS" : "FAIL"): Caps Lock in Korean, expected=ㄱ, actual=\(text.string)")
+    // Preservation remembers English uppercase; ESC still ends lowercase, even when the frontmost app changes meanwhile.
+    // Last, since the probe gives up focus.
+    for activation in [false, true] {
+        // With long press on, a switch keeps the remembered case, so a hold sets it instead.
+        if saved.bool(forKey: "longPressCapsLock") {
+            try prepare(english, caps: false, responder: sink)
+            // A hold toggles the remembered case, which may already be uppercase.
+            for _ in 0..<2 where !lock() { try post(target.keyCode, hold: 0.7); pump(0.5) }
+        } else {
+            try prepare(english, caps: true, responder: sink)
+        }
+        guard delegate.currentLanguage.hasPrefix("en"), lock() else { throw failure(6, "Could not reach English uppercase.") }
+        try post(target.keyCode); pump(0.8)
+        guard delegate.currentLanguage.hasPrefix("ko") else { throw failure(6, "The switch key did not reach Korean.") }
+        try post(kVK_Escape)
+        if activation { NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first?.activate(options: []) }
+        pump(0.8)
+        expect(activation ? "ESC while another app activates" : "ESC over remembered uppercase", "en", caps: false)
+    }
+    print("PROBE RESULT: \(passed)/\(total) ESC and Caps Lock cases")
+    guard passed == total else { throw failure(7, "ESC expectations failed.") }
+}
+
 func runUpdateInstallTests() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("gksdud-installer-test-\(UUID().uuidString)")
     let fm = FileManager.default
@@ -558,3 +796,4 @@ func runNativeOptionSymbolTests() {
     }
     print("PASS: native Option-won/keypad during selection/delivery, repeated symbols, ordered Hangul replay and balanced key-up")
 }
+#endif

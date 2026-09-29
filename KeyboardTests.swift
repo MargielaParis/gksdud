@@ -1,5 +1,6 @@
 import AppKit
 
+#if TESTS
 func runSettingsReentrancyTests() throws {
     let suite = "io.gksdud.reentrancy-tests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -394,6 +395,70 @@ func runRightControlTests() {
     print("PASS: right Control across F13-F20, left Control preservation, source changes, saved selection, restart, disable restoration")
 }
 
+// Caps Lock chosen as a Korean/English key while Caps Lock in Korean is on, from the menu and from the keyboard sheet.
+// Warnings are answered in order without a modal loop; nothing may reach system settings.
+func runCapsLockKeyTests() {
+    _ = NSApplication.shared
+    let suite = "io.gksdud.caps-key-tests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let keyboard = TestKeyboard("caps-key-1", name: "Keyboard", serial: "caps-key"), key = keyboard.identity.key
+    let untouched = ShortcutPreferences(read: { [:] }, write: { _ in preconditionFailure("A warning must stop the change before it is applied") }, activate: {})
+    let engine = Engine(defaults: defaults, discover: { [keyboard] }, shortcutPreferences: untouched)
+    defaults.set(false, forKey: "active")
+    _ = try? engine.keyboards.snapshot()
+    let delegate = AppDelegate(engine: engine)
+    delegate.buildWindow()
+    var answers: [NSApplication.ModalResponse] = [], warnings: [String] = []
+    delegate.runAlert = { alert in
+        warnings.append(alert.messageText)
+        return answers.isEmpty ? .alertSecondButtonReturn : answers.removeFirst()
+    }
+    let capsWarning = "Caps Lock을 한영 키로 사용합니다.", otherMapping = "\(sourceNames[2])에 다른 매핑이 있습니다."
+    let capsMapped: Mapping = [srcKey: NSNumber(value: sources[2]), dstKey: NSNumber(value: UInt64(0x7000000e2))]
+    func chooseCapsLock(_ replies: [NSApplication.ModalResponse]) {
+        answers = replies; warnings = []
+        delegate.picker.selectItem(withTitle: sourceNames[2])
+        precondition(delegate.picker.sendAction(delegate.picker.action, to: delegate.picker.target))
+    }
+    // Saved first and undone on a cancelled warning, like the sheet.
+    func setKeyboardKeys(_ keys: [UInt64]?, _ replies: [NSApplication.ModalResponse]) {
+        answers = replies; warnings = []
+        let saved = engine.keyboards.known[key]?.sources
+        engine.keyboards.setSources(keys, for: key)
+        if !delegate.confirmKeyboardChange([key]) { engine.keyboards.setSources(saved, for: key) }
+    }
+    defaults.set(true, forKey: "koreanCapsLock")
+    chooseCapsLock([])
+    precondition(warnings == [capsWarning] && engine.defaultSources == [sources[0]] && engine.koreanCapsLock, "Cancel keeps both the keys and Caps Lock in Korean")
+    chooseCapsLock([.alertFirstButtonReturn])
+    precondition(engine.defaultSources == [sources[2]] && !engine.koreanCapsLock, "Confirming turns Caps Lock in Korean off")
+    precondition(!delegate.koreanCapsSwitch.isEnabled && delegate.koreanCapsSwitch.state == .off)
+    engine.defaultSources = [sources[0]]; delegate.resetSelection()
+    // Confirmed, then cancelled at the next warning: Caps Lock already has another mapping, so nothing is applied.
+    keyboard.mappings = [capsMapped]
+    defaults.set(true, forKey: "koreanCapsLock")
+    delegate.enabled.state = .on
+    chooseCapsLock([.alertFirstButtonReturn])
+    precondition(warnings == [capsWarning, otherMapping], "Both warnings are shown in order")
+    precondition(engine.defaultSources == [sources[0]] && engine.koreanCapsLock, "A change cancelled after the Caps Lock warning keeps Caps Lock in Korean")
+    keyboard.mappings = []
+    setKeyboardKeys([sources[2]], [])
+    precondition(warnings == [capsWarning] && engine.keyboards.known[key]?.sources == nil && engine.koreanCapsLock,
+        "Cancel in the keyboard sheet keeps the keyboard's keys and Caps Lock in Korean")
+    setKeyboardKeys([sources[2]], [.alertFirstButtonReturn])
+    precondition(engine.keyboards.known[key]?.sources == [sources[2]] && !engine.koreanCapsLock, "One keyboard's Caps Lock key turns Caps Lock in Korean off")
+    engine.keyboards.setSources(nil, for: key)
+    keyboard.mappings = [capsMapped]
+    defaults.set(true, forKey: "koreanCapsLock"); defaults.set(true, forKey: "active")
+    setKeyboardKeys([sources[2]], [.alertFirstButtonReturn])
+    precondition(warnings == [capsWarning, otherMapping] && engine.keyboards.known[key]?.sources == nil && engine.koreanCapsLock,
+        "A sheet change cancelled after the Caps Lock warning keeps Caps Lock in Korean")
+    delegate.specialStatus.isHidden = false; delegate.refreshSpecialMode()
+    precondition(delegate.specialStatus.isHidden, "Empty special-character status takes no room")
+    print("PASS: Caps Lock as a Korean/English key from the menu and the keyboard sheet: warning, cancel, confirm, cancel at the next warning")
+}
+
 // Renders native UI against fake devices; never opens a real HID client or applies system settings.
 func renderKeyboardUI(to directory: String) throws {
     let app = NSApplication.shared
@@ -441,6 +506,7 @@ func renderKeyboardUI(to directory: String) throws {
             try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: directory).appendingPathComponent("menubar-warning.png"))
         }
     }
+    func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
     func save(_ view: NSView, _ name: String) throws {
         let visible = view.window?.isVisible == true
         view.wantsLayer = true
@@ -504,6 +570,20 @@ func renderKeyboardUI(to directory: String) throws {
         try save(delegate.window.contentView!, "right-control-\(name).png")
     }
     print("PASS: source picker actions and saved selection for right Command, right Option, Caps Lock, right Control and Space combinations")
+    // Caps Lock chosen as a Korean/English key while Caps Lock in Korean is on: the warning, then the tab once confirmed.
+    // runCapsLockKeyTests checks the answers.
+    defaults.set(true, forKey: "koreanCapsLock")
+    let savedSources = engine.defaultSources
+    delegate.runAlert = { alert in
+        alert.layout(); try? save(alert.window.contentView!, "caps-taken-alert.png")
+        return .alertFirstButtonReturn
+    }
+    delegate.picker.selectItem(withTitle: sourceNames[2])
+    precondition(delegate.picker.sendAction(delegate.picker.action, to: delegate.picker.target))
+    delegate.runAlert = { $0.runModal() }
+    delegate.selectTab(1)
+    try save(delegate.window.contentView!, "caps-taken.png")
+    engine.defaultSources = savedSources; delegate.resetSelection()
     for mode in [1, 2, 1] {
         // Exercise real checkbox actions with activation off so no live tap is installed.
         delegate.specialButtons[mode - 1].performClick(nil)
@@ -515,7 +595,6 @@ func renderKeyboardUI(to directory: String) throws {
     delegate.selectTab(0)
     // Kept on screen like the open sheet in the app; a hidden window skips periodic refreshes.
     settings.window.orderFront(nil)
-    func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
     func setSegment(_ control: NSSegmentedControl, _ segment: Int) { control.selectedSegment = segment; _ = control.sendAction(control.action, to: control.target) }
     let ui = descendants(settings.window.contentView!)
     let toggle = ui.compactMap { $0 as? NSSegmentedControl }.first { $0.segmentCount == 2 }!
@@ -651,3 +730,4 @@ func renderKeyboardUI(to directory: String) throws {
     print("PASS: default and per-keyboard segments and key dropdowns, warnings on key and mode changes, sheet cancel, rows rebuilt under a sheet, hidden refresh, warning UI recovery")
     print("Rendered UI to \(directory)")
 }
+#endif
