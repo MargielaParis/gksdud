@@ -48,7 +48,7 @@ func runSettingsReentrancyTests() throws {
     }
     failActivation = true
     // The full apply path must release its outer guard if activation fails, before it reaches menu settings.
-    do { _ = try engine.apply(source: sources[0], target: targets[6]); preconditionFailure("Expected activation failure") } catch {}
+    do { _ = try engine.apply(sources: [sources[0]], target: targets[6]); preconditionFailure("Expected activation failure") } catch {}
     precondition(!engine.active && !engine.isUpdatingSettings && defaults.bool(forKey: "shortcutBackedUp"))
     failActivation = false
     try engine.repair()
@@ -182,7 +182,7 @@ func runKeyboardTests() {
     }
     let manager = KeyboardManager(defaults: defaults, discover: discover)
     func repair(_ source: UInt64 = command, _ target: UInt64 = f19, active: Bool = true) -> KeyboardReconcileResult {
-        manager.reconcile(source: source, target: target, active: active)
+        manager.reconcile(sources: [source], target: target, active: active)
     }
     precondition(manager.defaultEnabled)
     precondition(repair().applied == 1)
@@ -247,7 +247,7 @@ func runKeyboardTests() {
         scans += 1
         return scans == 1 ? [disappearing, newOff] : [newOff]
     }
-    let disappeared = disappearanceManager.reconcile(source: command, target: f19, active: true)
+    let disappeared = disappearanceManager.reconcile(sources: [command], target: f19, active: true)
     precondition(disappeared.pending == 0 && disappearanceManager.failures.isEmpty)
 
     enumerationFails = true
@@ -269,6 +269,57 @@ func runKeyboardTests() {
     manager.setMode(.off, for: reconnected.identity.key)
     _ = repair()
     precondition(reconnected.mappings.contains(mapping(command, targets[4].usage)), "Off restores existing external mapping")
+    let capsLock = sources[2], leftOption: UInt64 = 0x7000000e2
+    let plain = TestKeyboard("7", serial: "plain"), custom = TestKeyboard("8", serial: "custom", mappings: [mapping(capsLock, leftOption)])
+    devices = [plain, custom]; _ = repair()
+    manager.setSources([option, capsLock], for: custom.identity.key); _ = repair()
+    func same(_ lhs: [Mapping], _ rhs: [Mapping]) -> Bool { KeyboardManager.canonical(lhs) == KeyboardManager.canonical(rhs) }
+    precondition(plain.mappings == [mapping(command, f19)] && same(custom.mappings, [mapping(option, f19), mapping(capsLock, f19)]),
+        "A keyboard's own keys all switch, and only on that keyboard")
+    precondition(KeyboardManager(defaults: defaults, discover: discover).known[custom.identity.key]?.sources == [option, capsLock], "A keyboard's keys survive restart")
+    manager.setSources(nil, for: custom.identity.key); _ = repair()
+    precondition(same(custom.mappings, [mapping(command, f19), mapping(capsLock, leftOption)]), "Default restores each key's original mapping")
+    _ = manager.reconcile(sources: [command, option], target: f19, active: true)
+    precondition(same(plain.mappings, [mapping(command, f19), mapping(option, f19)]), "Several global keys apply together")
+    _ = manager.reconcile(sources: [command, option], target: f19, active: false)
+    precondition(plain.mappings.isEmpty && custom.mappings == [mapping(capsLock, leftOption)])
+    let growing = TestKeyboard("9", serial: "growing")
+    devices = [growing]; _ = repair()
+    growing.mappings.append(mapping(leftOption, f19))
+    manager.setSources([command, option], for: growing.identity.key); _ = repair()
+    precondition(growing.mappings.contains(mapping(command, f19)) && !growing.mappings.contains(mapping(option, f19)),
+        "A conflict is found before any write, so the working key stays mapped")
+    growing.mappings.removeAll { $0 == mapping(leftOption, f19) }
+    var writes = growing.writes; _ = repair()
+    precondition(same(growing.mappings, [mapping(command, f19), mapping(option, f19)]) && growing.writes == writes + 1, "Adding a key is one write")
+    manager.setSources([option], for: growing.identity.key)
+    writes = growing.writes; _ = repair()
+    precondition(growing.mappings == [mapping(option, f19)] && growing.writes == writes + 1, "Dropping a key restores it in the same write")
+    manager.records = [growing.registryID: ["source": "x,\(option)", "original": "none,\(leftOption)", "target": String(f19)]]
+    _ = repair(active: false)
+    precondition(growing.mappings == [mapping(option, leftOption)], "An unreadable undo entry must not shift the others")
+    manager.setSources([], for: growing.identity.key)
+    precondition(manager.known[growing.identity.key]?.sources == nil, "Saving no keys means Default")
+    let unverified = TestKeyboard("10", serial: "unverified")
+    devices = [unverified]; _ = repair()
+    manager.setSources([command, option], for: unverified.identity.key); _ = repair()
+    unverified.afterWrite = { unverified.failRead = true }
+    _ = repair(command, targets[7].usage)
+    unverified.afterWrite = nil; unverified.failRead = false
+    manager.setSources([command], for: unverified.identity.key)
+    precondition(repair(command, targets[7].usage).applied == 1 && unverified.mappings == [mapping(command, targets[7].usage)],
+        "A key dropped after a failed readback is ours, not a conflict")
+    let savedSuite = "io.gksdud.saved-keys-tests.\(UUID().uuidString)"
+    let savedDefaults = UserDefaults(suiteName: savedSuite)!
+    defer { savedDefaults.removePersistentDomain(forName: savedSuite) }
+    for (saved, expected): ([UInt64], [UInt64]) in [([], [command]), ([1], [command]), ([1, capsLock, option], [option, capsLock])] {
+        let keyboard = SavedKeyboard(key: plain.identity.key, name: plain.name, detail: "", mode: .on, sources: saved)
+        savedDefaults.set(try! JSONEncoder().encode([keyboard.key: keyboard]), forKey: "knownKeyboards")
+        precondition(KeyboardManager(defaults: savedDefaults, discover: { [plain] }).sources(for: plain, default: [command]) == expected,
+            "Saved keys that are empty or unknown fall back to the global keys")
+    }
+    let legacy = try! JSONDecoder().decode(SavedKeyboard.self, from: Data(#"{"key":"k","name":"n","detail":"d","mode":"on"}"#.utf8))
+    precondition(legacy.sources == nil, "Older saved keyboards follow the global keys")
 
     let a = KeyboardIdentity(properties: ["Product": "Keyboard", "VendorID": "2", "ProductID": "4", "SerialNumber": "S", "LocationID": "1"])
     let b = KeyboardIdentity(properties: ["Product": "Keyboard", "VendorID": "2", "ProductID": "4", "SerialNumber": "S", "LocationID": "2"])
@@ -306,7 +357,7 @@ func runRightControlTests() {
     let original = [mapping(leftControl, 0x7000000e2), mapping(rightControl, 0x7000000e3)]
     let keyboard = TestKeyboard("control", mappings: original)
     let engine = Engine(defaults: defaults, discover: { [keyboard] })
-    precondition(engine.source == sources[0], "The default remains right Command")
+    precondition(engine.defaultSources == [sources[0]], "The default remains right Command")
     precondition(sources.contains(rightControl), "Right Control must be selectable")
     for target in targets {
         defaults.set(target.name, forKey: "target")
@@ -318,7 +369,7 @@ func runRightControlTests() {
             "Changing to right Control removes the previous owned mapping")
         precondition(keyboard.mappings.contains(original[0]), "Left Control mapping must stay unchanged")
         let restarted = Engine(defaults: defaults, discover: { [keyboard] })
-        precondition(restarted.source == rightControl && restarted.target.name == target.name)
+        precondition(restarted.defaultSources == [rightControl] && restarted.target.name == target.name)
         let writes = keyboard.writes
         precondition((try! restarted.reconcile()) == 1 && keyboard.writes == writes, "Restart keeps the selected mapping")
         defaults.set(String(sources[1]), forKey: "source")
@@ -347,12 +398,12 @@ func renderKeyboardUI(to directory: String) throws {
     let disconnected = TestKeyboard("preview-3", name: "SP109 Wireless Keyboard", serial: "external")
     var devices: [KeyboardDevice] = [builtIn, virtual, disconnected]
     let engine = Engine(defaults: defaults, discover: { devices })
-    _ = engine.keyboards.reconcile(source: sources[0], target: f19, active: true)
+    _ = engine.keyboards.reconcile(sources: [sources[0]], target: f19, active: true)
     engine.keyboards.setMode(.on, for: virtual.identity.key)
     engine.keyboards.setMode(.off, for: disconnected.identity.key)
     devices = [builtIn, virtual]
     virtual.mappings = []; virtual.failWrite = true
-    for _ in 0..<3 { _ = engine.keyboards.reconcile(source: sources[0], target: f19, active: true) }
+    for _ in 0..<3 { _ = engine.keyboards.reconcile(sources: [sources[0]], target: f19, active: true) }
     let previewRelease = AppRelease(tag_name: "v9.0.0", html_url: "https://github.com/codingnoye/gksdud/releases/tag/v9.0.0", body: "## 요약\n- 설정을 일반·대소문자·특수문자·gksdud 탭으로 나눴습니다.\n- 한글에서도 Option 특수문자를 입력할 수 있습니다.\n- 새 버전이 나오면 메뉴에서 알려드립니다.\n\n## 설치\n요약에 나타나면 안 됩니다.", draft: false, prerelease: false)
     defaults.set(try JSONEncoder().encode(previewRelease), forKey: "updates.release")
     let delegate = AppDelegate(engine: engine)
@@ -361,8 +412,12 @@ func renderKeyboardUI(to directory: String) throws {
     delegate.window.makeFirstResponder(nil)
     delegate.updateMenu()
     defer { if let item = delegate.item { NSStatusBar.system.removeStatusItem(item) } }
-    let settings = KeyboardSettingsController(manager: engine.keyboards) {
-        _ = engine.keyboards.reconcile(source: sources[0], target: f19, active: true)
+    // Wired like AppDelegate, except that the test answers warnings and repair always applies.
+    var allowChanges = true, checked: [(keyboards: Set<String>, conflict: UInt64?)] = []
+    let settings = KeyboardSettingsController(engine: engine, sourcesChanged: { delegate.picker.show($0); delegate.selectionChanged() }, confirm: {
+        checked.append(($0, engine.conflict(engine.defaultSources, target: engine.target, only: $0))); return allowChanges
+    }) {
+        _ = engine.keyboards.reconcile(sources: engine.defaultSources, target: engine.target.usage, active: true)
         delegate.refreshKeyboardState()
     }
     try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
@@ -377,6 +432,7 @@ func renderKeyboardUI(to directory: String) throws {
         }
     }
     func save(_ view: NSView, _ name: String) throws {
+        let visible = view.window?.isVisible == true
         view.wantsLayer = true
         view.effectiveAppearance.performAsCurrentDrawingAppearance {
             view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
@@ -388,7 +444,7 @@ func renderKeyboardUI(to directory: String) throws {
         guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw KeyboardError.read }
         view.cacheDisplay(in: view.bounds, to: bitmap)
         try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: directory).appendingPathComponent(name))
-        view.window?.orderOut(nil)
+        if !visible { view.window?.orderOut(nil) }
     }
     for (name, appearance) in [("light", NSAppearance.Name.aqua), ("dark", NSAppearance.Name.darkAqua)] {
         delegate.window.appearance = NSAppearance(named: appearance)
@@ -419,7 +475,7 @@ func renderKeyboardUI(to directory: String) throws {
                                           ("Caps Lock ⇪", 0x700000039), ("우측 Control ⌃", 0x7000000e4)] {
         delegate.picker.selectItem(withTitle: title)
         precondition(delegate.picker.sendAction(delegate.picker.action, to: delegate.picker.target))
-        precondition(engine.source == usage, "The selected label must save the matching HID key")
+        precondition(engine.defaultSources == [usage], "The selected label must save the matching HID key")
         delegate.picker.selectItem(at: 0)
         delegate.resetSelection()
         precondition(delegate.picker.titleOfSelectedItem == title, "Saved key selection must be restored")
@@ -439,29 +495,117 @@ func renderKeyboardUI(to directory: String) throws {
     delegate.specialButtons[0].performClick(nil)
     precondition(delegate.specialMode == .none && delegate.specialButtons.allSatisfy { $0.state == .off })
     delegate.selectTab(0)
+    // Kept on screen like the open sheet in the app; a hidden window skips periodic refreshes.
+    settings.window.orderFront(nil)
     func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+    func setSegment(_ control: NSSegmentedControl, _ segment: Int) { control.selectedSegment = segment; _ = control.sendAction(control.action, to: control.target) }
     let ui = descendants(settings.window.contentView!)
     let toggle = ui.compactMap { $0 as? NSSegmentedControl }.first { $0.segmentCount == 2 }!
-    toggle.selectedSegment = 0; _ = toggle.sendAction(toggle.action, to: toggle.target)
+    setSegment(toggle, 0)
     precondition(!engine.keyboards.defaultEnabled)
     let segments = ui.compactMap { $0 as? NSSegmentedControl }.filter { $0.segmentCount == 3 }
     let virtualControl = segments[1]
-    virtualControl.selectedSegment = 0
-    _ = virtualControl.sendAction(virtualControl.action, to: virtualControl.target)
+    setSegment(virtualControl, 0)
     precondition(engine.keyboards.known[virtual.identity.key]?.mode == .off)
     precondition(engine.keyboards.warning == nil && delegate.keyboardWarningRow.isHidden && delegate.warningBadge.isHidden)
     precondition(virtualControl.superview != nil, "Mode changes must preserve the focused native control")
-    let detachedControl = segments[2]
-    detachedControl.selectedSegment = 2
-    _ = detachedControl.sendAction(detachedControl.action, to: detachedControl.target)
+    setSegment(segments[2], 2)
     precondition(engine.keyboards.known[disconnected.identity.key]?.mode == .on, "Disconnected rows remain editable")
     devices.append(disconnected)
-    _ = engine.keyboards.reconcile(source: sources[0], target: f19, active: true)
+    settings.changed()
     settings.refresh()
-    precondition(disconnected.mappings.contains { $0[srcKey]?.uint64Value == sources[0] && $0[dstKey]?.uint64Value == f19 })
+    precondition(disconnected.mappings.contains { $0[srcKey]?.uint64Value == sources[3] && $0[dstKey]?.uint64Value == f19 }, "Reconnected keyboards follow the global key")
+    settings.window.layoutIfNeeded()
+    let rows = descendants(settings.window.contentView!)
+    func picker(_ label: String) -> SourcePicker { rows.compactMap { $0 as? SourcePicker }.first { $0.accessibilityLabel() == label }! }
+    func modeControl(_ keyboard: TestKeyboard) -> NSSegmentedControl {
+        rows.compactMap { $0 as? NSSegmentedControl }.first { $0.accessibilityLabel() == "\(keyboard.name) 적용 설정" }!
+    }
+    func choose(_ picker: SourcePicker, _ index: Int) { picker.selectItem(at: index); _ = picker.sendAction(picker.action, to: picker.target) }
+    // Opens the multi-key sheet from the picker's last item, toggles keys by title and presses a sheet button.
+    func toggleMultiple(_ picker: SourcePicker, _ titles: [String], press button: String = "완료") {
+        let parent = picker.window!
+        choose(picker, picker.numberOfItems - 1)
+        let buttons = descendants(parent.attachedSheet!.contentView!).compactMap { $0 as? NSButton }
+        for title in titles + [button] { buttons.first { $0.title == title }!.performClick(nil) }
+        precondition(parent.attachedSheet == nil)
+    }
+    let defaultPicker = picker("기본 한영 키"), detachedPicker = picker("\(disconnected.name) 한영 키"), builtInPicker = picker("\(builtIn.name) 한영 키")
+    precondition(defaultPicker.titleOfSelectedItem == sourceNames[3] && detachedPicker.itemTitles.first == "기본값 (\(sourceNames[3]))"
+        && detachedPicker.itemTitles.last == "다중 한영 키", "Rows start with Default, labeled with the global key, and end with multiple keys")
+    choose(detachedPicker, 3)
+    precondition(engine.keyboards.known[disconnected.identity.key]?.sources == [sources[2]] && engine.defaultSources == [sources[3]])
+    precondition(checked.last?.keyboards == [disconnected.identity.key], "Per-keyboard keys are checked")
+    let foreign: Mapping = [srcKey: NSNumber(value: sources[1]), dstKey: NSNumber(value: targets[5].usage)]
+    disconnected.mappings.append(foreign)
+    allowChanges = false
+    choose(detachedPicker, 2)
+    precondition(checked.last?.conflict == sources[1] && engine.keyboards.known[disconnected.identity.key]?.sources == [sources[2]]
+        && detachedPicker.titleOfSelectedItem == sourceNames[2], "The warning checks the new key, and cancelling it keeps the saved key")
+    precondition(engine.targetInUse(engine.defaultSources, target: targets[5], only: [disconnected.identity.key])
+        && !engine.targetInUse(engine.defaultSources, target: targets[5], only: [builtIn.identity.key]), "Target collisions are checked per keyboard")
+    disconnected.mappings.removeAll { $0 == foreign }
+    virtual.mappings = [foreign]
+    allowChanges = true
+    choose(picker("\(virtual.name) 한영 키"), 2)
+    precondition(checked.last?.keyboards == [virtual.identity.key] && checked.last?.conflict == nil
+        && engine.keyboards.known[virtual.identity.key]?.sources == [sources[1]], "An Off keyboard's keys are not applied yet")
+    allowChanges = false
+    setSegment(modeControl(virtual), 2)
+    precondition(checked.last?.conflict == sources[1] && engine.keyboards.known[virtual.identity.key]?.mode == .off
+        && modeControl(virtual).selectedSegment == 0, "Turning a keyboard on checks its keys, and cancelling keeps it off")
+    setSegment(toggle, 1)
+    precondition(checked.last?.keyboards == [builtIn.identity.key] && !engine.keyboards.defaultEnabled && toggle.selectedSegment == 0,
+        "Turning Default on checks the keyboards on Default, and cancelling keeps it off")
+    allowChanges = true
+    virtual.mappings = []
+    choose(picker("\(virtual.name) 한영 키"), 0)
+    setSegment(toggle, 1)
+    precondition(engine.keyboards.defaultEnabled && builtIn.mappings.contains { $0[srcKey]?.uint64Value == sources[3] && $0[dstKey]?.uint64Value == f19 })
+    toggleMultiple(detachedPicker, [sourceNames[0]])
+    precondition(engine.keyboards.known[disconnected.identity.key]?.sources == [sources[0], sources[2]]
+        && detachedPicker.titleOfSelectedItem == "\(sourceNames[0]) +1", "Several keys show the first key and a count")
+    precondition([sources[0], sources[2]].allSatisfy { key in disconnected.mappings.contains { $0[srcKey]?.uint64Value == key && $0[dstKey]?.uint64Value == f19 } })
+    toggleMultiple(detachedPicker, [sourceNames[3]], press: "취소")
+    precondition(engine.keyboards.known[disconnected.identity.key]?.sources == [sources[0], sources[2]], "Cancel keeps the saved keys")
+    toggleMultiple(builtInPicker, [], press: "취소")
+    precondition(engine.keyboards.known[builtIn.identity.key]?.sources == nil, "Cancel keeps a keyboard on Default")
+    toggleMultiple(builtInPicker, [])
+    precondition(engine.keyboards.known[builtIn.identity.key]?.sources == nil && builtInPicker.indexOfSelectedItem == 0,
+        "Done with the Default keys unchanged keeps a keyboard on Default")
+    toggleMultiple(defaultPicker, [sourceNames[1]])
+    precondition(engine.defaultSources == [sources[1], sources[3]] && defaultPicker.titleOfSelectedItem == "\(sourceNames[1]) +1"
+        && delegate.picker.titleOfSelectedItem == "\(sourceNames[1]) +1" && builtInPicker.titleOfSelectedItem == "기본값 (\(sourceNames[1]) +1)",
+        "Global keys set here reach the main window and Default rows")
+    settings.changed()
+    precondition([sources[1], sources[3]].allSatisfy { key in builtIn.mappings.contains { $0[srcKey]?.uint64Value == key && $0[dstKey]?.uint64Value == f19 } },
+        "Default keyboards apply every global key")
+    try save(settings.window.contentView!, "keyboards-multi.png")
+    toggleMultiple(detachedPicker, [sourceNames[0], sourceNames[2]])
+    precondition(engine.keyboards.known[disconnected.identity.key]?.sources == nil, "Checking no keys returns a keyboard to Default")
+    toggleMultiple(defaultPicker, [sourceNames[1], sourceNames[3]])
+    precondition(engine.defaultSources == [sources[1]] && defaultPicker.titleOfSelectedItem == sourceNames[1], "Checking no keys keeps one global key")
+    delegate.resetSelection()
+    toggleMultiple(delegate.picker, [sourceNames[2]])
+    precondition(engine.defaultSources == [sources[1], sources[2]] && delegate.picker.titleOfSelectedItem == "\(sourceNames[1]) +1")
+    settings.refresh()
+    choose(detachedPicker, detachedPicker.numberOfItems - 1)
+    let sheet = settings.window.attachedSheet!
+    try save(sheet.contentView!, "keyboards-sheet.png")
+    devices.removeAll { $0 === disconnected }
+    settings.changed(); settings.refresh()
+    precondition(!descendants(settings.window.contentView!).contains { $0 === detachedPicker }, "Disconnecting rebuilds the rows")
+    for title in [sourceNames[0], "완료"] { descendants(sheet.contentView!).compactMap { $0 as? NSButton }.first { $0.title == title }!.performClick(nil) }
+    precondition(engine.keyboards.known[disconnected.identity.key]?.sources == [sources[0], sources[1], sources[2]], "A row rebuilt under the sheet keeps its choice")
+    settings.window.orderOut(nil)
+    engine.defaultSources = [sources[3]]; settings.refresh()
+    precondition(defaultPicker.titleOfSelectedItem == "\(sourceNames[1]) +1", "A hidden window skips refreshes")
+    settings.window.orderFront(nil); settings.refresh()
+    precondition(defaultPicker.titleOfSelectedItem == sourceNames[3], "A shown window catches up")
+    settings.window.orderOut(nil)
     delegate.refreshKeyboardState()
     delegate.window.appearance = NSAppearance(named: .aqua)
     try save(delegate.window.contentView!, "settings-recovered.png")
-    print("PASS: native default segments, per-keyboard segment actions, disconnected editing/reconnection, warning UI recovery")
+    print("PASS: default and per-keyboard segments and key dropdowns, warnings on key and mode changes, sheet cancel, rows rebuilt under a sheet, hidden refresh, warning UI recovery")
     print("Rendered UI to \(directory)")
 }
