@@ -141,6 +141,101 @@ func runShortcutRestoreTests() throws {
     print("PASS: normalized F-key shortcut restoration, disabled/missing baselines, user edits, target changes, legacy backups, restore retry")
 }
 
+// Quitting undoes this app's changes to macOS, but logout or restart can end it with SIGTERM at any step, so the saved
+// activation choice must already be the user's at each one. The Mac input menu is this app's only while its icon replaces it.
+func runExitTests() throws {
+    let suite = "io.gksdud.exit-tests.\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let original: [String: Any] = ["enabled": true, "value": ["type": "standard", "parameters": [32, 49, 262144]]]
+    var keys: [String: Any] = ["60": original]
+    var menu: CFPropertyList?
+    var menuWrites = 0, failActivation = false
+    // What a process killed at that moment would leave saved.
+    var savedAtSteps: [Bool] = []
+    func saved() -> Bool { UserDefaults(suiteName: suite)!.bool(forKey: "active") }
+    let keyboard = TestKeyboard("exit-1", serial: "exit")
+    let shortcuts = ShortcutPreferences(read: { keys }, write: { keys = $0; savedAtSteps.append(saved()) }, activate: {
+        savedAtSteps.append(saved())
+        if failActivation { throw KeyboardError.verification }
+    })
+    let inputMenu = InputMenuPreference(read: { menu }, write: { menu = $0; menuWrites += 1; savedAtSteps.append(saved()) })
+    func menuValue() -> Bool? { (menu as? NSNumber)?.boolValue }
+    // The launch steps that touch macOS, as AppDelegate runs them.
+    func launch() throws -> Engine {
+        let engine = Engine(defaults: defaults, discover: { [keyboard] }, shortcutPreferences: shortcuts, inputMenu: inputMenu)
+        engine.accessibilityTrusted = { true }
+        try engine.resume()
+        try engine.repair()
+        return engine
+    }
+    func applied() -> Bool { !keyboard.mappings.isEmpty && Engine.ownsShortcut(keys["60"], keyCode: 80) && menuValue() == false }
+    func restored() -> Bool { keyboard.mappings.isEmpty && Engine.sameShortcut(keys["60"], original) && menu == nil }
+
+    var engine = try launch()
+    _ = try engine.apply(sources: [sources[0]], target: targets[6])
+    precondition(applied())
+    keyboard.afterWrite = { savedAtSteps.append(saved()) }
+    savedAtSteps = []
+    try engine.restoreSystem()
+    precondition(savedAtSteps.count == 4 && savedAtSteps.allSatisfy { $0 }, "No quit step saves activation off")
+    precondition(restored() && engine.active, "Quit restores macOS and keeps activation")
+    engine = try launch()
+    precondition(applied(), "The next launch applies everything again")
+
+    // Killed while activateSettings runs: the next launch finishes what cleanup left.
+    failActivation = true
+    do { try engine.restoreSystem(); preconditionFailure("Expected activation failure") } catch {}
+    failActivation = false
+    precondition(saved() && !engine.isUpdatingSettings)
+    engine = try launch()
+    precondition(applied(), "A quit cut short leaves activation to resume")
+    // A quit cancelled by a failed cleanup, or an update whose installer did not start, keeps running.
+    for fails in [true, false] {
+        failActivation = fails
+        do { try engine.restoreSystem(); precondition(!fails) } catch { precondition(fails) }
+        failActivation = false
+        try engine.resume(); try engine.repair()
+        precondition(applied(), "Staying after cleanup applies the shortcut and input menu again, not only the mappings")
+    }
+
+    try engine.restore()
+    precondition(!saved() && restored(), "Turning off is saved at once")
+    try engine.restoreSystem()
+    engine = try launch()
+    precondition(!engine.active && restored(), "Explicitly off stays off")
+    keyboard.afterWrite = nil
+
+    // With this app's icon off or not replacing the Mac input menu, the menu is left as the user has it, however they change it.
+    for (hidden, replaces) in [(true, true), (false, false), (true, false)] {
+        for setting: CFPropertyList? in [nil, kCFBooleanFalse, kCFBooleanTrue] {
+            defaults.set(hidden, forKey: "hidden"); defaults.set(replaces, forKey: "replaceInputMenu")
+            menu = setting; menuWrites = 0
+            _ = try engine.apply(sources: [sources[0]], target: targets[6])
+            menu = kCFBooleanFalse
+            try engine.restoreSystem()
+            engine = try launch()
+            precondition(menuValue() == false && menuWrites == 0, "The Mac input menu stays the user's own setting")
+            try engine.restore()
+        }
+    }
+    // While the icon replaces it, the menu hides; the user's setting comes back, including one made in between.
+    defaults.set(false, forKey: "hidden"); defaults.set(true, forKey: "replaceInputMenu")
+    menu = nil
+    _ = try engine.apply(sources: [sources[0]], target: targets[6])
+    precondition(menuValue() == false)
+    defaults.set(true, forKey: "hidden"); try engine.updateSystemInputMenu()
+    precondition(menu == nil, "Hiding the icon gives the menu back")
+    menu = kCFBooleanFalse
+    defaults.set(false, forKey: "hidden"); try engine.updateSystemInputMenu()
+    defaults.set(true, forKey: "hidden"); try engine.updateSystemInputMenu()
+    precondition(menuValue() == false, "A change made in System Settings in between is the new baseline")
+    defaults.set(false, forKey: "hidden"); try engine.updateSystemInputMenu()
+    try engine.restoreSystem()
+    precondition(menuValue() == false)
+    print("PASS: activation kept at every quit step, relaunch after quit or a quit cut short, off stays off, Mac input menu left to the user unless replaced")
+}
+
 final class TestKeyboard: KeyboardDevice {
     let registryID: String
     let name: String
@@ -181,7 +276,8 @@ func runKeyboardTests() {
         if enumerationFails { throw KeyboardError.enumeration }
         return devices
     }
-    let manager = KeyboardManager(defaults: defaults, discover: discover)
+    var invalidations = 0
+    let manager = KeyboardManager(defaults: defaults, discover: discover, invalidate: { invalidations += 1 })
     func repair(_ source: UInt64 = command, _ target: UInt64 = f19, active: Bool = true) -> KeyboardReconcileResult {
         manager.reconcile(sources: [source], target: target, active: active)
     }
@@ -217,8 +313,10 @@ func runKeyboardTests() {
     precondition(newOff.writes == 0, "New keyboards inherit default Off")
     manager.defaultEnabled = true
     virtual.failWrite = true
+    invalidations = 0
     let partial = repair()
     precondition(partial.applied == 2 && partial.pending == 1, "One failure must not stop later devices")
+    precondition(invalidations == 1, "A failed write lists keyboards on a new HID client")
     precondition(manager.warning == nil)
     _ = repair(); precondition(manager.warning == nil)
     _ = repair(); precondition(manager.warning != nil, "Warn after three consecutive failures")
@@ -227,15 +325,19 @@ func runKeyboardTests() {
 
     // A failed readback can mean the write succeeded. Off must still undo it.
     virtual.afterWrite = { virtual.failRead = true }
+    invalidations = 0
     _ = repair(command, targets[7].usage)
     virtual.afterWrite = nil; virtual.failRead = false
+    precondition(invalidations == 1, "So does a failed read")
     manager.setMode(.off, for: virtual.identity.key)
     _ = repair(command, targets[7].usage)
     precondition(virtual.mappings.isEmpty, "Undo the pending destination after a failed verification")
     manager.setMode(.on, for: virtual.identity.key)
     virtual.ignoreWrite = true
+    invalidations = 0
     _ = repair(); _ = repair(); _ = repair()
     precondition(manager.warning != nil, "Successful setter with wrong readback is still a failure")
+    precondition(invalidations == 3, "And a readback that does not match")
     devices.removeAll { $0.registryID == virtual.registryID }
     _ = repair(); precondition(manager.warning == nil, "Disconnected devices must not leave warnings")
     virtual.ignoreWrite = false
@@ -338,8 +440,10 @@ func runKeyboardTests() {
     precondition(v1.key == v2.key, "Virtual keyboard version changes preserve preference")
     let conflicting = TestKeyboard("6", serial: "conflict", mappings: [mapping(option, f19)])
     devices = [conflicting]
+    invalidations = 0
     _ = repair(); _ = repair(); _ = repair()
     precondition(manager.warning != nil && conflicting.writes == 0, "Do not claim a destination used by another mapping")
+    precondition(invalidations == 0, "A conflict keeps the HID client")
     conflicting.mappings = []
     _ = repair(); precondition(manager.warning == nil)
     manager.setMode(.off, for: conflicting.identity.key)
@@ -998,6 +1102,13 @@ func runPermissionTests() {
         "Without this app's icon the Mac input menu shows, and the choice waits")
     delegate.showInMenuBar.state = .on; delegate.toggleHidden()
     precondition(delegate.replaceInputMenu.isEnabled && !engine.showsSystemInputMenu)
-    print("PASS: without Accessibility, settings disabled and activation off; granted again, settings back and activation still off; replacing the Mac input menu")
+    // The indicator refreshes every second; the same source and style keep the image showing, so nothing redraws.
+    delegate.updateInputIndicator()
+    let shown = delegate.inputBadge.image
+    delegate.updateInputIndicator()
+    precondition(shown != nil && delegate.inputBadge.image === shown, "An unchanged source keeps its image")
+    delegate.iconPicker.selectItem(at: (delegate.iconStyle + 1) % 4); delegate.changeIconStyle()
+    precondition(delegate.inputBadge.image !== shown, "Another style shows at once")
+    print("PASS: without Accessibility, settings disabled and activation off; granted again, settings back and activation still off; replacing the Mac input menu; indicator image kept while unchanged")
 }
 #endif
