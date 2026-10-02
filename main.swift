@@ -199,6 +199,9 @@ final class Engine {
             && systemShortcutKeys().contains { $0.keyCode == kVK_Space && spaceCombo(flags: CGEventFlags(rawValue: UInt64($0.modifiers))) == key }
     }
     var accessibilityTrusted: () -> Bool = { AXIsProcessTrusted() }
+    // While the screen is locked or another user's session is in front, keyboards keep their own keys: no key press
+    // reaches the tap there, so a mapped Caps Lock could not even turn uppercase off. The app sets this at launch.
+    var sessionAway: () -> Bool = { false }
     // Mapped like a Korean/English key, but only while the tap can act on it. A Space combination stays in the tap.
     var separateMapping: ExtraKey? {
         guard active, usesSeparateKey, separateSource != nil, let key = separateKey, sources.contains(key), accessibilityTrusted() else { return nil }
@@ -325,7 +328,7 @@ final class Engine {
         defaults.removeObject(forKey: "inputMenuBackedUp")
     }
     func reconcile() throws -> Int {
-        keyboards.reconcile(sources: defaultSources, target: target.usage, active: active, extra: separateMapping).applied
+        keyboards.reconcile(sources: defaultSources, target: target.usage, active: active, away: sessionAway(), extra: separateMapping).applied
     }
     // Turning off is saved before anything is undone, so a later failure retries the undo instead of reapplying.
     func restore() throws {
@@ -485,6 +488,12 @@ func setCapsLock(_ enabled: Bool) throws {
     guard result == KERN_SUCCESS else {
         throw NSError(domain: "gksdud", code: Int(result), userInfo: [NSLocalizedDescriptionKey: "Caps Lock 상태를 변경하지 못했습니다."])
     }
+}
+
+// Read from the session: secure input turns on and off on the lock screen, and the lock notice can come 0.5 seconds late.
+func screenLockedOrAway() -> Bool {
+    guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+    return info["CGSSessionScreenIsLocked"] as? Bool == true || info[kCGSessionOnConsoleKey as String] as? Bool == false
 }
 
 // Only the reserved function key is synthesized. Text keys are never buffered.
@@ -689,7 +698,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     DispatchQueue.main.async { [weak owner] in owner?.switchToLowercaseEnglish(caps: caps) }
                 }
                 if type == .flagsChanged {
-                    if owner.capsPreservationActive && event.getIntegerValueField(.keyboardEventKeycode) == 57 {
+                    // Caps Lock on the lock screen is for the password there. Back in English, followCapsLock takes the lock as left.
+                    if owner.capsPreservationActive && event.getIntegerValueField(.keyboardEventKeycode) == 57 && !owner.engine.sessionAway() {
                         let source = owner.currentSource
                         owner.englishCaps.capsKeyChanged(english: source?.language.hasPrefix("en") == true,
                             actual: event.flags.contains(.maskAlphaShift), korean: owner.showsEnglishCase(source))
@@ -849,7 +859,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         scheduleCapsRestore()
     }
     func restoreEnglishCaps() {
-        guard !optionInput.busy, capsPreservationActive, pendingCapsState == nil else { return }
+        // The lock screen selects U.S. for itself; restoring there would start the password in the remembered case.
+        guard !optionInput.busy, capsPreservationActive, pendingCapsState == nil, !engine.sessionAway() else { return }
         // With Caps Lock in Korean, Korean shows the English case as well; its input method turns Caps Lock off on the way in.
         let source = currentSource
         guard let desired = englishCaps.target(english: source?.language.hasPrefix("en") == true || showsEnglishCase(source)),
@@ -1034,6 +1045,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         updateTimer?.tolerance = 60
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(inputSourceChanged), name: Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil)
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(enabledSourcesChanged), name: Notification.Name(kTISNotifyEnabledKeyboardInputSourcesChanged as String), object: nil)
+        engine.sessionAway = screenLockedOrAway
+        for name in ["com.apple.screenIsLocked", "com.apple.screenIsUnlocked"] {
+            DistributedNotificationCenter.default().addObserver(self, selector: #selector(screenLockChanged), name: Notification.Name(name), object: nil)
+        }
         let center = NSWorkspace.shared.notificationCenter
         observers.append(center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notice in
             guard let self, let owner = self.longPressOwner,
@@ -1372,13 +1387,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         do { try engine.restore(); lastError = ""; stickyError = ""; repairFailed = false; refreshStatus() } catch { report(error) }
         resetSelection(); syncCapsPreservation(); updatePressAccess(); refreshKeyboardState()
     }
-    func recover() { sourceCache = nil; queuedSwitch = nil; releaseHeldKeys(); optionInput.cancel(); cancelCapsRestore(); englishCaps.switching = false; cancelLongPress(); longPress = LongPressState(); pressGate.held.removeAll(); spaceGate = SpaceComboGate(); separateGate.held.removeAll(); for delay in [0.5, 2.0, 5.0] { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.repair() } } }
+    func recover() { sourceCache = nil; queuedSwitch = nil; releaseHeldKeys(); optionInput.cancel(); if capsRestoreTasks.isEmpty { englishCaps.switching = false }; cancelLongPress(); longPress = LongPressState(); pressGate.held.removeAll(); spaceGate = SpaceComboGate(); separateGate.held.removeAll(); for delay in [0.5, 2.0, 5.0] { DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.repair() } } }
+    // The tap does not see Caps Lock on another user's login window, and leaves it alone on the lock screen. Coming back
+    // with English (or Korean showing the English case) selected, the lock as left there is the English case. A restore on
+    // its way finishes first: unlocking can land in Korean while its input method turns the lock off.
+    func followCapsLock() {
+        guard capsPreservationActive, !englishCaps.switching, !engine.sessionAway() else { return }
+        let source = currentSource
+        englishCaps.capsKeyChanged(english: source?.language.hasPrefix("en") == true, actual: actualCaps, korean: showsEnglishCase(source))
+    }
+    // The 1-second repair follows the lock too; this only makes it sooner.
+    @objc func screenLockChanged(_ notification: Notification) {
+        // Key releases on the lock screen never reached the tap, so keys held before it count as released.
+        if notification.name.rawValue == "com.apple.screenIsUnlocked" { recover() }
+        repair()
+    }
     func repair() {
         guard !engine.isUpdatingSettings else { return }
         // Without Accessibility there is no tap to switch with, so activation turns off and stays off until turned on again.
         if engine.active && !engine.accessibilityTrusted() { restoreNow(); return }
         ensureKeyTap()
         do { try engine.repair(); if repairFailed { repairFailed = false; stickyError = "" } } catch { report(error); repairFailed = !(error is KeyboardError) }
+        // This follows the session itself, as the unlock notice can come late. Not at once: right after unlocking, the lock
+        // screen's U.S. can still be selected.
+        let away = engine.sessionAway()
+        if sessionWasAway && !away { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.followCapsLock() } }
+        sessionWasAway = away
         if engine.keyboards.result.pending == 0 { lastError = "" }
         refreshStatus(); refreshKeyboardState()
     }
@@ -1394,6 +1428,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var lastError = ""
     var stickyError = ""
     var repairFailed = false
+    var sessionWasAway = false
     func report(_ error: Error) {
         if error is KeyboardError { refreshKeyboardState(); return }
         stickyError = error.localizedDescription; refreshStatus()
