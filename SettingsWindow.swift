@@ -119,7 +119,7 @@ extension AppDelegate {
             replaceInputMenu.topAnchor.constraint(equalTo: replaceRow.topAnchor), replaceInputMenu.bottomAnchor.constraint(equalTo: replaceRow.bottomAnchor)])
         hint("⌘+드래그로 위치를 옮길 수 있어요.", in: general)
         general.setCustomSpacing(12, after: general.arrangedSubviews.last!); full(replaceRow, in: general)
-        iconPicker.addItems(withTitles: ["한 / dud", "한 / A", "KO / EN", "ㅎuㅎ / dud"])
+        iconPicker.addItems(withTitles: ["한 / dud", "한 / a", "ko / en", "ㅎuㅎ / dud"])
         iconPicker.selectItem(at: iconStyle); iconPicker.target = self; iconPicker.action = #selector(changeIconStyle)
         iconPicker.setAccessibilityLabel("메뉴바 아이콘 조합")
         for preview in [koreanPreview, englishPreview] {

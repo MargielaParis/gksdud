@@ -292,7 +292,7 @@ extension AppDelegate {
     }
     func sourceIcon(_ source: InputSourceIdentity) -> NSImage {
         isKorean(source) || isEnglish(source) ? sourceMenuIcon(korean: isKorean(source))
-            : badgeImage(label: sourceBadgeLabel(source.language, position: sourcePosition(source.id)), filled: false)
+            : badgeImage(label: sourceBadgeLabel(source.language, position: sourcePosition(source.id)).lowercased(), filled: false)
     }
     // Counted in the cycle's order, which starts as Korean, English, then the rest; a source outside it follows that
     // default order.

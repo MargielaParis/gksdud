@@ -1161,6 +1161,11 @@ func runPermissionTests() {
     precondition(shown != nil && delegate.inputBadge.image === shown, "An unchanged source keeps its image")
     delegate.iconPicker.selectItem(at: (delegate.iconStyle + 1) % 4); delegate.changeIconStyle()
     precondition(delegate.inputBadge.image !== shown, "Another style shows at once")
+    for style in 0...2 {
+        delegate.iconPicker.selectItem(at: style); delegate.changeIconStyle()
+        precondition(delegate.iconLabel(korean: false) == ["dud", "a", "en"][style] && delegate.iconLabel(korean: false, upper: true) == ["DuD", "A", "EN"][style]
+            && delegate.iconLabel(korean: true, upper: true) == ["한", "한", "ko"][style], "English shows Caps Lock, Korean stays")
+    }
     print("PASS: without Accessibility, settings disabled and activation off; granted again, settings back and activation still off; replacing the Mac input menu; indicator image kept while unchanged")
 }
 #endif
