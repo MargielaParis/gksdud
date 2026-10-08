@@ -465,6 +465,9 @@ struct EnglishCapsState {
         guard english || korean, !switching || intoEnglish else { return }
         remembered = actual
     }
+    // A change only a key's flags showed, as after a Caps Lock press that sent no event of its own. English only and not
+    // mid-switch, where the Korean input method turns the lock off by itself.
+    mutating func lockSeen(english: Bool, actual: Bool) { if english && !switching { remembered = actual } }
     func target(english: Bool) -> Bool? { english ? remembered : nil }
     func beforeLongPress(actual: Bool, preserving: Bool) -> Bool { preserving ? (remembered ?? actual) : actual }
     mutating func committedLongPress(_ desired: Bool) { remembered = desired }
@@ -718,7 +721,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                     // Modifier events carry the lock, also a change no key made. A Caps Lock press right after a lock set by
                     // software sends none, so keys catch it too, the switch key before its pulse. Only the HID system's own
                     // events (no posting process): keystrokes other apps post leave the lock out.
-                    if event.getIntegerValueField(.eventSourceUnixProcessID) == 0 { owner.observeCaps(event.flags.contains(.maskAlphaShift)) }
+                    if event.getIntegerValueField(.eventSourceUnixProcessID) == 0 {
+                        owner.observeCaps(event.flags.contains(.maskAlphaShift),
+                            capsKey: type == .flagsChanged && event.getIntegerValueField(.keyboardEventKeycode) == 57)
+                    }
                 }
                 // Before Option input, which would otherwise type Option+Space. While it replays
                 // queued strokes, a combination waits in its queue to keep the order.
@@ -852,7 +858,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     // The session's lock. It follows posted events and lags a change until its event passes, and a Caps Lock press right
     // after a lock set by software sends none.
     var actualCaps: Bool { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) }
-    // The lock as the tap last saw it on a key or this app last set it, nil while no tap watches it.
+    // The lock as the tap last saw it on a key, nil while no tap watches it.
     var observedCaps: Bool?
     var currentCaps: Bool { observedCaps ?? actualCaps }
     var capsPreservationActive: Bool { engine.active && !engine.paused && engine.preserveCapsLock && AXIsProcessTrusted() }
@@ -863,7 +869,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     // on the way in. Only a running tap kept it on.
     func releaseKoreanCaps() {
         guard keyTap != nil, !koreanCapsActive, currentSource?.id == capsSafeKorean, currentCaps else { return }
-        try? applyCapsLock(false)
+        try? setCapsLock(false)
     }
     // The English case preservation restores, even before it has.
     var rememberedUpper: Bool { capsPreservationActive && englishCaps.target(english: true) == true }
@@ -906,7 +912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let source = currentSource
         guard let desired = englishCaps.target(english: source?.language.hasPrefix("en") == true || showsEnglishCase(source)),
               currentCaps != desired else { return }
-        do { try applyCapsLock(desired); showSwitchError(nil, on: preserveCapsSwitch) }
+        do { try setCapsLock(desired); showSwitchError(nil, on: preserveCapsSwitch) }
         catch { showSwitchError(error.localizedDescription, on: preserveCapsSwitch) }
     }
     func scheduleCapsRestore() {
@@ -1036,7 +1042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         pendingCapsState = nil
         capsConfirmationTimer?.cancel(); capsConfirmationTimer = nil
         do {
-            try applyCapsLock(desired)
+            try setCapsLock(desired)
             if capsPreservationActive { englishCaps.committedLongPress(desired) }
             scheduleCapsRestore()
             showSwitchError(nil, on: capsTransitionFeature)
@@ -1344,17 +1350,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         return englishIconCase(inEnglish: inEnglish, lock: currentCaps,
             restores: self.capsPreservationActive ? self.englishCaps.target(english: true) : nil)
     }
-    func observeCaps(_ caps: Bool) {
+    func observeCaps(_ caps: Bool, capsKey: Bool = false) {
         guard caps != observedCaps else { return }
+        let seen = observedCaps != nil
         observedCaps = caps
+        // The Caps Lock key's own event has its path in the tap. After a reset a change is not known to be new.
+        if seen && !capsKey && capsPreservationActive && !engine.sessionAway() {
+            englishCaps.lockSeen(english: currentLanguage.hasPrefix("en"), actual: caps)
+        }
         // After the event goes on; the option is read only on a change.
         if showsIconCase { DispatchQueue.main.async { [weak self] in self?.showIndicator() } }
-    }
-    // Every lock change this app makes. With the tap, its event updates the lock seen, so a change that did not take is
-    // set again by the next check.
-    func applyCapsLock(_ value: Bool) throws {
-        try setCapsLock(value)
-        if keyTap == nil && showsIconCase { showIndicator() }
     }
     func menuWillOpen(_ menu: NSMenu) {
         refreshAddedMenuItems(menu)
