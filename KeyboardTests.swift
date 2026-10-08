@@ -1190,6 +1190,12 @@ func runPermissionTests() {
             && delegate.inputBadge.image === delegate.badgeImage(label: "JA", filled: false), "Other sources stay as they were")
         precondition(badge(english, caps: true) === upper, "The same icon is kept, not drawn again")
     }
+    // Hiding the menu bar icon keeps the choice but turns it off and dims it, as with replacing the Mac input menu.
+    delegate.showInMenuBar.state = .off; delegate.toggleHidden()
+    precondition(!delegate.iconCaseSwitch.isEnabled && delegate.iconCaseSwitch.state == .on && !delegate.showsIconCase
+        && badge(english, caps: true) === badge(english, caps: false), "Hidden, the choice waits")
+    delegate.showInMenuBar.state = .on; delegate.toggleHidden()
+    precondition(delegate.iconCaseSwitch.isEnabled && delegate.showsIconCase && badge(english, caps: true) !== badge(english, caps: false))
     delegate.iconCaseSwitch.state = .off; delegate.toggleIconCase()
     // The character's D eye draws differently from its d.
     func pixels(_ image: NSImage) -> Data {

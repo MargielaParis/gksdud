@@ -604,7 +604,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     let koreanPreview = NSImageView()
     let englishPreview = NSImageView()
     var iconStyle: Int { let value = engine.defaults.integer(forKey: "iconStyle"); return (0...3).contains(value) ? value : 0 }
-    var showsIconCase: Bool { engine.defaults.bool(forKey: "iconCase") }
+    // The case option waits while the menu bar icon is hidden, as replacing the Mac input menu does.
+    var showsIconCase: Bool { engine.defaults.bool(forKey: "iconCase") && !engine.defaults.bool(forKey: "hidden") }
     let enabled = NSButton(checkboxWithTitle: "활성화", target: nil, action: nil)
     let login = NSButton(checkboxWithTitle: "로그인 시 시작", target: nil, action: nil)
     let showInMenuBar = NSButton(checkboxWithTitle: "메뉴바에 표시", target: nil, action: nil)
@@ -798,10 +799,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         addedSources.refresh()
         let trusted = engine.accessibilityTrusted()
         // Switching needs the tap, so without Accessibility only the permission button and the gksdud tab can be used.
-        for control: NSControl in [enabled, login, showInMenuBar, iconPicker, iconCaseSwitch, picker, advancedButton] + specialButtons { control.isEnabled = trusted }
+        for control: NSControl in [enabled, login, showInMenuBar, iconPicker, picker, advancedButton] + specialButtons { control.isEnabled = trusted }
         // Only this app's icon can replace the Mac input menu.
         replaceInputMenu.state = engine.replacesInputMenu ? .on : .off
         replaceInputMenu.isEnabled = trusted && showInMenuBar.state == .on
+        iconCaseSwitch.isEnabled = trusted && showInMenuBar.state == .on
         for preview in [koreanPreview, englishPreview] { preview.contentTintColor = trusted ? .labelColor : .disabledControlTextColor }
         for (label, color) in settingLabels { label.textColor = trusted ? color : .disabledControlTextColor }
         let ready = keyTap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false
@@ -1381,7 +1383,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { if showInMenuBar.state == .off { showSettings() }; return true }
     @objc func toggleHidden() {
         engine.defaults.set(showInMenuBar.state == .off, forKey: "hidden")
-        updateMenu(); updatePressAccess()
+        tapCaps = nil
+        updateMenu(); updatePressAccess(); updateInputIndicator()
         if engine.active { do { try engine.updateSystemInputMenu() } catch { report(error) } }
     }
     @objc func toggleReplaceInputMenu() {
