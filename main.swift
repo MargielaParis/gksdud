@@ -508,7 +508,9 @@ func nativeSwitchPulse(from event: CGEvent, marker: Int64) -> (CGEvent, CGEvent)
     for pulse in [down, up] {
         // Strip held modifiers, but preserve the function-key identity flags.
         // macOS may normalize F19's shortcut mask to SecondaryFn (0x800000).
-        pulse.flags = event.flags.intersection([.maskSecondaryFn, .maskNumericPad])
+        // Caps Lock stays: the session takes the lock from posted events, and a pulse without it read as off until the
+        // next key, so restoring the case set the lock again mid-switch and the switch bounced back.
+        pulse.flags = event.flags.intersection([.maskSecondaryFn, .maskNumericPad, .maskAlphaShift])
         pulse.setIntegerValueField(.keyboardEventAutorepeat, value: 0)
         pulse.setIntegerValueField(.eventSourceUserData, value: marker)
     }
@@ -516,7 +518,10 @@ func nativeSwitchPulse(from event: CGEvent, marker: Int64) -> (CGEvent, CGEvent)
 }
 // A Space combination has no F-key event to copy; a new one carries the flags macOS gives F-keys.
 func nativeSwitchPulse(keyCode: Int, marker: Int64) -> (CGEvent, CGEvent)? {
-    CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: true).flatMap { nativeSwitchPulse(from: $0, marker: marker) }
+    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: true) else { return nil }
+    if CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) { event.flags.insert(.maskAlphaShift) }
+    else { event.flags.remove(.maskAlphaShift) }
+    return nativeSwitchPulse(from: event, marker: marker)
 }
 
 // ESC that may switch: modified ESC stays a shortcut, and a held one acts once.
@@ -545,6 +550,21 @@ enum EnglishRoute { case now, awaitSwitch, sendSwitch }
 func englishRoute(from language: String, switching: Bool) -> EnglishRoute {
     language.hasPrefix("en") ? (switching ? .sendSwitch : .now) : (switching ? .awaitSwitch : .sendSwitch)
 }
+
+// The text of a menu bar icon style; the character style draws a face instead. `upper` is the English case to show, or
+// nil for English as it always looked. Only English shows the case.
+func iconLabel(style: Int, korean: Bool, upper: Bool? = nil) -> String {
+    if korean { return style == 2 ? "KO" : "한" }
+    switch style {
+    case 0: return upper == true ? "DuD" : "dud"
+    case 1: return upper == false ? "a" : "A"
+    default: return upper == false ? "en" : "EN"
+    }
+}
+
+// The case English icons show: the lock while English is current, and elsewhere the case preservation restores on the
+// way back, or the lock without it.
+func englishIconCase(inEnglish: Bool, lock: Bool, restores: Bool?) -> Bool { inEnglish ? lock : restores ?? lock }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, NSTextFieldDelegate {
     let engine: Engine
@@ -584,14 +604,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     let koreanPreview = NSImageView()
     let englishPreview = NSImageView()
     var iconStyle: Int { let value = engine.defaults.integer(forKey: "iconStyle"); return (0...3).contains(value) ? value : 0 }
-    // English and other sources show uppercase while Caps Lock is on.
-    func iconLabel(korean: Bool, upper: Bool = false) -> String {
-        korean ? (iconStyle == 2 ? "ko" : "한") : [upper ? "DuD" : "dud", upper ? "A" : "a", upper ? "EN" : "en", "캐릭터"][iconStyle]
-    }
+    var showsIconCase: Bool { engine.defaults.bool(forKey: "iconCase") }
     let enabled = NSButton(checkboxWithTitle: "활성화", target: nil, action: nil)
     let login = NSButton(checkboxWithTitle: "로그인 시 시작", target: nil, action: nil)
     let showInMenuBar = NSButton(checkboxWithTitle: "메뉴바에 표시", target: nil, action: nil)
     let replaceInputMenu = NSButton(checkboxWithTitle: "Mac 입력기 아이콘 대체", target: nil, action: nil)
+    let iconCaseSwitch = NSButton(checkboxWithTitle: "대소문자를 영문 아이콘에 반영", target: nil, action: nil)
     let status = NSTextField(wrappingLabelWithString: "")
     var timer: Timer?
     var menuInputTimer: Timer?
@@ -716,8 +734,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                         owner.englishCaps.capsKeyChanged(english: source?.language.hasPrefix("en") == true,
                             actual: event.flags.contains(.maskAlphaShift), korean: owner.showsEnglishCase(source))
                     }
-                    if event.getIntegerValueField(.keyboardEventKeycode) == 57 {
-                        let caps = event.flags.contains(.maskAlphaShift)
+                    // Every modifier event carries the lock, including a change no key made, so the icons follow it at once.
+                    let caps = event.flags.contains(.maskAlphaShift)
+                    if caps != owner.tapCaps && owner.showsIconCase {
+                        owner.tapCaps = caps
                         DispatchQueue.main.async { [weak owner] in owner?.noteCaps(caps) }
                     }
                     return Unmanaged.passUnretained(event)
@@ -778,7 +798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         addedSources.refresh()
         let trusted = engine.accessibilityTrusted()
         // Switching needs the tap, so without Accessibility only the permission button and the gksdud tab can be used.
-        for control: NSControl in [enabled, login, showInMenuBar, iconPicker, picker, advancedButton] + specialButtons { control.isEnabled = trusted }
+        for control: NSControl in [enabled, login, showInMenuBar, iconPicker, iconCaseSwitch, picker, advancedButton] + specialButtons { control.isEnabled = trusted }
         // Only this app's icon can replace the Mac input menu.
         replaceInputMenu.state = engine.replacesInputMenu ? .on : .off
         replaceInputMenu.isEnabled = trusted && showInMenuBar.state == .on
@@ -1180,25 +1200,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         updateInputIndicator()
     }
     @objc func menuBrand() { showAbout() }
-    func sourceMenuIcon(korean: Bool, upper: Bool = false) -> NSImage {
-        // Both dud styles draw the character for English.
-        iconStyle == 3 || iconStyle == 0 && !korean ? DudIcon.badge(korean: korean, upper: upper)
-            : badgeImage(label: iconLabel(korean: korean, upper: upper), filled: korean)
+    // The Korean or English icon of the chosen style. `upper` is the English case, nil without the case option.
+    func sourceMenuIcon(korean: Bool, upper: Bool? = nil) -> NSImage {
+        let style = iconStyle, upper = korean ? nil : upper
+        guard style == 3 else { return badgeImage(label: iconLabel(style: style, korean: korean, upper: upper), filled: korean) }
+        let key = "face|\(korean)|\(upper == true)"
+        if let image = iconCache[key] { return image }
+        let image = DudIcon.badge(korean: korean, upper: upper == true)
+        iconCache[key] = image
+        return image
     }
     @objc func changeIconStyle() {
         engine.defaults.set(iconPicker.indexOfSelectedItem, forKey: "iconStyle")
-        refreshIconPreviews()
         updateInputIndicator()
-        for entry in item?.menu?.items ?? [] {
-            if entry.action == #selector(selectKorean) { entry.image = sourceMenuIcon(korean: true) }
-            if entry.action == #selector(selectEnglish) { entry.image = sourceMenuIcon(korean: false) }
-        }
     }
-    func refreshIconPreviews() {
-        koreanPreview.image = sourceMenuIcon(korean: true)
-        englishPreview.image = sourceMenuIcon(korean: false)
+    @objc func toggleIconCase() {
+        engine.defaults.set(iconCaseSwitch.state == .on, forKey: "iconCase")
+        tapCaps = nil; knownCaps = nil
+        updateInputIndicator()
     }
+    // Icons are kept, so the refresh every second finds the one showing and sets nothing.
+    private var iconCache: [String: NSImage] = [:]
     func badgeImage(label: String, filled: Bool) -> NSImage {
+        let key = "\(filled)|\(label)"
+        if let image = iconCache[key] { return image }
         let image = NSImage(size: NSSize(width: 22, height: 20), flipped: false) { rect in
             let shape = NSBezierPath(roundedRect: rect.insetBy(dx: 0.75, dy: 1.25), xRadius: 3, yRadius: 3)
             NSColor.black.set()
@@ -1215,6 +1240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             return true
         }
         image.isTemplate = true
+        iconCache[key] = image
         return image
     }
     func language(_ source: TISInputSource) -> String {
@@ -1253,42 +1279,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
     func updateInputIndicator() {
         // The Option-character round trip selects English for a moment; didFinish refreshes afterwards.
-        guard !optionInput.busy, switchLanding == nil else { return }
-        guard let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return }
-        let lang = language(current)
-        updateInputMenuState(language: lang)
-        let other = sourceBadgeLabel(lang, position: currentSource.flatMap { sourcePosition($0.id) })
-        let upper = recentCaps.flatMap { ProcessInfo.processInfo.systemUptime - $0.at < 0.5 ? $0.value : nil } ?? actualCaps
-        let label = lang.hasPrefix("ko") ? iconLabel(korean: true) : lang.hasPrefix("en") ? iconLabel(korean: false, upper: upper) : other
-        let korean = lang.hasPrefix("ko")
-        // This runs every second, and setting an image redraws it; keep the one showing while the source, style and case stay.
-        let key = "\(iconStyle)|\(lang)|\(label)|\(!korean && upper)"
-        let badge: NSImage
-        if let shown = shownBadge, shown.key == key { badge = shown.image } else {
-            // Let the status bar resolve contrast, including its initial appearance and highlighting.
-            badge = korean || lang.hasPrefix("en") ? sourceMenuIcon(korean: korean, upper: upper)
-                : badgeImage(label: upper ? other : other.lowercased(), filled: false)
-            shownBadge = (key, badge)
-        }
-        if inputBadge.image !== badge {
-            inputBadge.image = badge
-            inputBadge.setAccessibilityLabel("현재 입력: \(korean ? "한국어" : lang.hasPrefix("en") ? "영어" : label)")
-        }
+        guard !optionInput.busy, switchLanding == nil, let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return }
+        let source = Self.sourceIdentity(current) ?? InputSourceIdentity(id: "", language: language(current))
+        let badge = isKorean(source) || isEnglish(source) ? "" : sourceBadgeLabel(source.language, position: sourcePosition(source.id))
+        indicator = (source, badge)
+        showIndicator()
+    }
+    // The current source as last read, and its badge text when it is neither Korean nor English.
+    var indicator: (source: InputSourceIdentity, badge: String)?
+    // Shows `indicator` without asking macOS again, as a Caps Lock change does.
+    func showIndicator() {
+        guard let (source, other) = indicator else { return }
+        let korean = isKorean(source), english = isEnglish(source), upper = englishCase()
+        // Let the status bar resolve contrast, including its initial appearance and highlighting.
+        let badge = korean || english ? sourceMenuIcon(korean: korean, upper: upper) : badgeImage(label: other, filled: false)
+        let name = korean ? "한국어" : english ? "영어" : other
+        if inputBadge.image !== badge { inputBadge.image = badge; inputBadge.setAccessibilityLabel("현재 입력: \(name)") }
         if tabButtons.first?.image !== badge { tabButtons.first?.image = badge }
+        refreshSourceIcons(current: source, englishUpper: upper)
         guard let button = item?.button else { return }
         if button.image !== badge { button.title = ""; button.image = badge; button.imagePosition = .imageOnly }
         let warning = engine.keyboards.warning.map { "\n\($0)" } ?? ""
-        let tip = "gksdud · 현재 입력 소스: \(lang)\(warning)"
-        let spoken = "gksdud, 현재 입력 \(korean ? "한국어" : lang.hasPrefix("en") ? "영어" : label)\(warning)"
+        let tip = "gksdud · 현재 입력 소스: \(source.language)\(warning)"
+        let spoken = "gksdud, 현재 입력 \(name)\(warning)"
         if button.toolTip != tip { button.toolTip = tip }
         if button.accessibilityLabel() != spoken { button.setAccessibilityLabel(spoken) }
     }
-    private var shownBadge: (key: String, image: NSImage)?
-    // The lock just pressed or set; reading it back right away can still give the old state.
-    private var recentCaps: (value: Bool, at: TimeInterval)?
+    // The Korean and English icons elsewhere: the menu, which also checks the current source, the previews and the added
+    // sources.
+    func refreshSourceIcons(current: InputSourceIdentity, englishUpper: Bool?) {
+        let korean = sourceMenuIcon(korean: true), english = sourceMenuIcon(korean: false, upper: englishUpper)
+        if koreanPreview.image !== korean { koreanPreview.image = korean }
+        if englishPreview.image !== english { englishPreview.image = english }
+        for entry in item?.menu?.items ?? [] {
+            switch entry.action {
+            case #selector(selectKorean): entry.state = isKorean(current) ? .on : .off; if entry.image !== korean { entry.image = korean }
+            case #selector(selectEnglish): entry.state = isEnglish(current) ? .on : .off; if entry.image !== english { entry.image = english }
+            case #selector(selectAddedSource(_:)): entry.state = entry.representedObject as? String == current.id ? .on : .off
+            default: break
+            }
+        }
+        if shownEnglishCase != .some(englishUpper) { shownEnglishCase = englishUpper; addedSources.refresh() }
+    }
+    private var shownEnglishCase: Bool??
+    // The lock as last pressed or set; reading it back right away can still give the old state.
+    private var knownCaps: (value: Bool, at: TimeInterval)?
+    // The lock the tap last passed on, so only a change reaches the icons.
+    var tapCaps: Bool?
+    // The case English icons show, nil with the option off.
+    func englishCase() -> Bool? {
+        guard showsIconCase else { return nil }
+        let lock = knownCaps.flatMap { ProcessInfo.processInfo.systemUptime - $0.at < 0.5 ? $0.value : nil } ?? actualCaps
+        let inEnglish = indicator.map { isEnglish($0.source) } ?? true
+        return englishIconCase(inEnglish: inEnglish, lock: lock,
+            restores: inEnglish || !capsPreservationActive ? nil : englishCaps.target(english: true))
+    }
     func noteCaps(_ value: Bool) {
-        recentCaps = (value, ProcessInfo.processInfo.systemUptime)
-        updateInputIndicator()
+        guard showsIconCase else { return }
+        knownCaps = (value, ProcessInfo.processInfo.systemUptime)
+        showIndicator()
     }
     func menuWillOpen(_ menu: NSMenu) {
         refreshAddedMenuItems(menu)
@@ -1317,13 +1366,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     func menuDidClose(_ menu: NSMenu) {
         menuInputTimer?.invalidate()
         menuInputTimer = nil
-    }
-    func updateInputMenuState(language: String) {
-        for entry in item?.menu?.items ?? [] {
-            if entry.action == #selector(selectKorean) { entry.state = language.hasPrefix("ko") ? .on : .off }
-            if entry.action == #selector(selectEnglish) { entry.state = language.hasPrefix("en") ? .on : .off }
-            if entry.action == #selector(selectAddedSource(_:)) { entry.state = entry.representedObject as? String == currentSource?.id ? .on : .off }
-        }
     }
     func selectLanguage(_ prefix: String) { if let source = availableSource(prefix) { rememberCapsBeforeSwitch(); _ = TISSelectInputSource(source) }; updateInputIndicator() }
     @objc func selectKorean() { selectLanguage("ko") }

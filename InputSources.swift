@@ -294,8 +294,8 @@ extension AppDelegate {
         sourceHistory = SourceHistory(ids.first == current ? ids : current.map { [$0] } ?? [])
     }
     func sourceIcon(_ source: InputSourceIdentity) -> NSImage {
-        isKorean(source) || isEnglish(source) ? sourceMenuIcon(korean: isKorean(source))
-            : badgeImage(label: sourceBadgeLabel(source.language, position: sourcePosition(source.id)).lowercased(), filled: false)
+        isKorean(source) || isEnglish(source) ? sourceMenuIcon(korean: isKorean(source), upper: englishCase())
+            : badgeImage(label: sourceBadgeLabel(source.language, position: sourcePosition(source.id)), filled: false)
     }
     // Counted in the cycle's order, which starts as Korean, English, then the rest; a source outside it follows that
     // default order.
@@ -431,7 +431,7 @@ final class AddedSourcesSettings: NSObject {
         var parts: [String] = [String(trusted), String(on), String(engine.addedSourceMode.rawValue), cycle.joined(separator: ",")]
         let separateKey: String = engine.separateKey.map { String($0) } ?? ""
         parts += [engine.separateSource ?? "", separateKey, enabled.map(\.id).joined(separator: ",")]
-        parts += [String(engine.separateKeyIsHangulKey()), String(engine.keyboards.result.extraBlocked), String(owner.iconStyle), error ?? ""]
+        parts += [String(engine.separateKeyIsHangulKey()), String(engine.keyboards.result.extraBlocked), String(owner.iconStyle), String(describing: owner.englishCase()), error ?? ""]
         parts += [String(engine.addedSourcesCompatible)]
         let state = parts.joined(separator: "|")
         guard force || state != signature else { return }

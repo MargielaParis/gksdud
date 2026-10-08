@@ -16,13 +16,13 @@ enum DudIcon {
                 eye.addLine(to: CGPoint(x: centerX + 42, y: 218))
                 eye.addEllipse(in: CGRect(x: centerX - 38, y: 244.2, width: 76, height: 76))
             } else if upper {
-                // A D eye spanning the same box as the d eye, for Caps Lock.
-                let radius: CGFloat = 67.2, arcX = centerX + 48 - radius
-                eye.move(to: CGPoint(x: centerX - 48, y: 185.8))
-                eye.addLine(to: CGPoint(x: arcX, y: 185.8))
-                eye.addArc(center: CGPoint(x: arcX, y: 253), radius: radius,
+                // A D eye for Caps Lock, narrower and lower than the d on the same baseline.
+                let left = centerX - 40, top: CGFloat = 208.2, bottom: CGFloat = 320.2, radius: CGFloat = 56
+                eye.move(to: CGPoint(x: left, y: top))
+                eye.addLine(to: CGPoint(x: centerX - 16, y: top))
+                eye.addArc(center: CGPoint(x: centerX - 16, y: top + radius), radius: radius,
                     startAngle: -.pi / 2, endAngle: .pi / 2, clockwise: false)
-                eye.addLine(to: CGPoint(x: centerX - 48, y: 320.2))
+                eye.addLine(to: CGPoint(x: left, y: bottom))
                 eye.closeSubpath()
             } else {
                 eye.move(to: CGPoint(x: centerX + 48, y: 185.8))
