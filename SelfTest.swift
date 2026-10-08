@@ -107,8 +107,8 @@ func runSelfTest() {
         precondition(nativeSwitchPulse(from: up, marker: 12345) == nil)
     }
     // Sent with the lock as it is then, so a pulse leaves the session's Caps Lock alone.
-    precondition(pulseFlags(.maskSecondaryFn, caps: true) == [.maskSecondaryFn, .maskAlphaShift]
-        && pulseFlags([.maskSecondaryFn, .maskAlphaShift], caps: false) == .maskSecondaryFn)
+    precondition(capsFlags(.maskSecondaryFn, caps: true) == [.maskSecondaryFn, .maskAlphaShift]
+        && capsFlags([.maskSecondaryFn, .maskAlphaShift], caps: false) == .maskSecondaryFn)
     let textKey = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)!
     precondition(nativeSwitchPulse(from: textKey, marker: 12345) == nil, "Never synthesize ordinary typing")
     print("PASS: F13-F20 native down/up pairs, marker, modifier isolation, Caps Lock as sent, original event preservation, text-key rejection")

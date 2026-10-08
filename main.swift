@@ -518,8 +518,8 @@ func nativeSwitchPulse(from event: CGEvent, marker: Int64) -> (CGEvent, CGEvent)
 func nativeSwitchPulse(keyCode: Int, marker: Int64) -> (CGEvent, CGEvent)? {
     CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(keyCode), keyDown: true).flatMap { nativeSwitchPulse(from: $0, marker: marker) }
 }
-// A pulse's flags with Caps Lock as it is.
-func pulseFlags(_ flags: CGEventFlags, caps: Bool) -> CGEventFlags { caps ? flags.union(.maskAlphaShift) : flags.subtracting(.maskAlphaShift) }
+// The flags of a key this app posts, with Caps Lock as it is then.
+func capsFlags(_ flags: CGEventFlags, caps: Bool) -> CGEventFlags { caps ? flags.union(.maskAlphaShift) : flags.subtracting(.maskAlphaShift) }
 
 // ESC that may switch: modified ESC stays a shortcut, and a held one acts once.
 func plainEscape(type: CGEventType, code: Int64, flags: CGEventFlags, repeated: Bool) -> Bool {
@@ -561,7 +561,7 @@ func iconLabel(style: Int, korean: Bool, upper: Bool? = nil) -> String {
 
 // The case English icons show: the lock while English is current, and elsewhere the case preservation restores on the
 // way back, or the lock without it.
-func englishIconCase(inEnglish: Bool, lock: Bool, restores: Bool?) -> Bool { inEnglish ? lock : restores ?? lock }
+func englishIconCase(inEnglish: Bool, lock: Bool, restores: @autoclosure () -> Bool?) -> Bool { inEnglish ? lock : restores() ?? lock }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, NSTextFieldDelegate {
     let engine: Engine
@@ -716,8 +716,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 if !ours && (type == .keyDown || type == .flagsChanged) {
                     owner.spaceGate.note(type: type, code: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags)
                     // Modifier events carry the lock, also a change no key made. A Caps Lock press right after a lock set by
-                    // software sends none, so keys catch it too, the switch key before its pulse.
-                    owner.observeCaps(event.flags.contains(.maskAlphaShift))
+                    // software sends none, so keys catch it too, the switch key before its pulse. Only the HID system's own
+                    // events (no posting process): keystrokes other apps post leave the lock out.
+                    if event.getIntegerValueField(.eventSourceUnixProcessID) == 0 { owner.observeCaps(event.flags.contains(.maskAlphaShift)) }
                 }
                 // Before Option input, which would otherwise type Option+Space. While it replays
                 // queued strokes, a combination waits in its queue to keep the order.
@@ -799,6 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         // Only this app's icon can replace the Mac input menu.
         replaceInputMenu.state = engine.replacesInputMenu ? .on : .off
         replaceInputMenu.isEnabled = trusted && showInMenuBar.state == .on
+        iconCaseSwitch.state = engine.defaults.bool(forKey: "iconCase") ? .on : .off
         iconCaseSwitch.isEnabled = trusted && showInMenuBar.state == .on
         for preview in [koreanPreview, englishPreview] { preview.contentTintColor = trusted ? .labelColor : .disabledControlTextColor }
         for (label, color) in settingLabels { label.textColor = trusted ? color : .disabledControlTextColor }
@@ -1051,7 +1053,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         // With the lock as it is now, not as when its key went down: the session takes the lock from posted events, and a
         // pulse read as off made restoring the case set the lock again mid-switch, which switched back.
         let caps = currentCaps
-        for event in [pulse.0, pulse.1] { event.flags = pulseFlags(event.flags, caps: caps) }
+        for event in [pulse.0, pulse.1] { event.flags = capsFlags(event.flags, caps: caps) }
         pulse.0.post(tap: .cghidEventTap); pulse.1.post(tap: .cghidEventTap)
     }
     // Only ESC asks, so the input source is read only while it is on.
@@ -1340,7 +1342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         guard showsIconCase else { return nil }
         let inEnglish = indicator.map { isEnglish($0.source) } ?? true
         return englishIconCase(inEnglish: inEnglish, lock: currentCaps,
-            restores: inEnglish || !capsPreservationActive ? nil : englishCaps.target(english: true))
+            restores: self.capsPreservationActive ? self.englishCaps.target(english: true) : nil)
     }
     func observeCaps(_ caps: Bool) {
         guard caps != observedCaps else { return }
@@ -1348,10 +1350,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         // After the event goes on; the option is read only on a change.
         if showsIconCase { DispatchQueue.main.async { [weak self] in self?.showIndicator() } }
     }
-    // Every lock change this app makes, so the pulses and icons know it before the session does.
+    // Every lock change this app makes. With the tap, its event updates the lock seen, so a change that did not take is
+    // set again by the next check.
     func applyCapsLock(_ value: Bool) throws {
         try setCapsLock(value)
-        if keyTap != nil { observeCaps(value) } else if showsIconCase { showIndicator() }
+        if keyTap == nil && showsIconCase { showIndicator() }
     }
     func menuWillOpen(_ menu: NSMenu) {
         refreshAddedMenuItems(menu)

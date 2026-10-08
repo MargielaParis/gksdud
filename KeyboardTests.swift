@@ -1163,8 +1163,9 @@ func runPermissionTests() {
     delegate.iconPicker.selectItem(at: (delegate.iconStyle + 1) % 4); delegate.changeIconStyle()
     precondition(delegate.englishPreview.image !== preview, "Another style shows at once")
     // Off by default, every style looks as it did; on, only English follows Caps Lock.
-    precondition((0...3).map { iconLabel(style: $0, korean: false) } == ["dud", "A", "EN", "EN"]
-        && (0...3).map { iconLabel(style: $0, korean: true) } == ["한", "한", "KO", "한"])
+    // The character style draws a face, so only the lettered ones have labels.
+    precondition((0...2).map { iconLabel(style: $0, korean: false) } == ["dud", "A", "EN"]
+        && (0...2).map { iconLabel(style: $0, korean: true) } == ["한", "한", "KO"])
     precondition((0...2).map { iconLabel(style: $0, korean: false, upper: false) } == ["dud", "a", "en"]
         && (0...2).map { iconLabel(style: $0, korean: false, upper: true) } == ["DuD", "A", "EN"]
         && (0...2).allSatisfy { iconLabel(style: $0, korean: true, upper: false) == iconLabel(style: $0, korean: true, upper: true) })
@@ -1194,7 +1195,8 @@ func runPermissionTests() {
     delegate.showInMenuBar.state = .off; delegate.toggleHidden()
     precondition(!delegate.iconCaseSwitch.isEnabled && delegate.iconCaseSwitch.state == .on && !delegate.showsIconCase
         && badge(english, caps: true) === badge(english, caps: false), "Hidden, the choice waits")
-    delegate.showInMenuBar.state = .on; delegate.toggleHidden()
+    // Shown again without putting another icon in the real menu bar.
+    engine.defaults.set(false, forKey: "hidden"); delegate.showInMenuBar.state = .on; delegate.updatePressAccess()
     precondition(delegate.iconCaseSwitch.isEnabled && delegate.showsIconCase && badge(english, caps: true) !== badge(english, caps: false))
     delegate.iconCaseSwitch.state = .off; delegate.toggleIconCase()
     // The lock seen last stands for the session's until no tap watches it.

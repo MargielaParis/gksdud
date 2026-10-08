@@ -275,7 +275,12 @@ extension AppDelegate {
         holdKeys = false
         let keys = heldKeys
         heldKeys = []
-        for key in keys { key.setIntegerValueField(.eventSourceUserData, value: nativePulseMarker); key.post(tap: .cghidEventTap) }
+        let caps = currentCaps
+        for key in keys {
+            // With the lock as it is now, as a key pressed now would have it.
+            key.flags = capsFlags(key.flags, caps: caps)
+            key.setIntegerValueField(.eventSourceUserData, value: nativePulseMarker); key.post(tap: .cghidEventTap)
+        }
     }
     // The recent sources macOS keeps, as far as they are known; otherwise only the current one.
     func seedSourceHistory() {
