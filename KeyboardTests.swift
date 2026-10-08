@@ -1175,7 +1175,7 @@ func runPermissionTests() {
     let japanese = (source: InputSourceIdentity(id: "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese", language: "ja"), badge: "JA")
     func badge(_ indicator: (source: InputSourceIdentity, badge: String), caps: Bool) -> NSImage? {
         delegate.indicator = indicator
-        if delegate.showsIconCase { delegate.noteCaps(caps) } else { delegate.showIndicator() }
+        delegate.observeCaps(caps); delegate.showIndicator()
         return delegate.inputBadge.image
     }
     precondition(!delegate.showsIconCase && delegate.iconCaseSwitch.state == .off && delegate.iconCaseSwitch.isEnabled)
@@ -1197,6 +1197,11 @@ func runPermissionTests() {
     delegate.showInMenuBar.state = .on; delegate.toggleHidden()
     precondition(delegate.iconCaseSwitch.isEnabled && delegate.showsIconCase && badge(english, caps: true) !== badge(english, caps: false))
     delegate.iconCaseSwitch.state = .off; delegate.toggleIconCase()
+    // The lock seen last stands for the session's until no tap watches it.
+    delegate.observeCaps(!delegate.actualCaps)
+    precondition(delegate.currentCaps != delegate.actualCaps)
+    delegate.stopKeyTap()
+    precondition(delegate.observedCaps == nil && delegate.currentCaps == delegate.actualCaps)
     // The character's D eye draws differently from its d.
     func pixels(_ image: NSImage) -> Data {
         let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 44, pixelsHigh: 40, bitsPerSample: 8, samplesPerPixel: 4,

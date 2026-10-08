@@ -365,6 +365,8 @@ final class AddedSourcesSettings: NSObject {
     let warning = NSTextField(wrappingLabelWithString: "")
     private let cycleRows = NSStackView(), separateRows = NSStackView()
     private var labels: [NSTextField] = []
+    // English icons in the order and the add menu, which follow its case without rebuilding the section.
+    private var englishIcons: [NSImageView] = [], englishItems: [NSMenuItem] = []
     private var signature = ""
     private var error: String?
     static let rowHeight: CGFloat = 26
@@ -431,7 +433,7 @@ final class AddedSourcesSettings: NSObject {
         var parts: [String] = [String(trusted), String(on), String(engine.addedSourceMode.rawValue), cycle.joined(separator: ",")]
         let separateKey: String = engine.separateKey.map { String($0) } ?? ""
         parts += [engine.separateSource ?? "", separateKey, enabled.map(\.id).joined(separator: ",")]
-        parts += [String(engine.separateKeyIsHangulKey()), String(engine.keyboards.result.extraBlocked), String(owner.iconStyle), String(describing: owner.englishCase()), error ?? ""]
+        parts += [String(engine.separateKeyIsHangulKey()), String(engine.keyboards.result.extraBlocked), String(owner.iconStyle), error ?? ""]
         parts += [String(engine.addedSourcesCompatible)]
         let state = parts.joined(separator: "|")
         guard force || state != signature else { return }
@@ -446,6 +448,7 @@ final class AddedSourcesSettings: NSObject {
         separateRows.isHidden = engine.addedSourceMode != .separate
         // Cycle: the saved order, with sources macOS no longer offers dimmed.
         list.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        englishIcons = []; englishItems = []
         for (index, id) in cycle.enumerated() {
             let source = enabled.first { $0.id == id }
             list.addArrangedSubview(cycleRow(id, source: source, index: index, count: cycle.count, usable: usable))
@@ -454,6 +457,7 @@ final class AddedSourcesSettings: NSObject {
         for source in enabled where !cycle.contains(source.id) {
             addPicker.addItem(withTitle: AppDelegate.sourceTitle(source.id))
             addPicker.lastItem?.representedObject = source.id; addPicker.lastItem?.image = owner.sourceIcon(source)
+            if isEnglish(source), let item = addPicker.lastItem { englishItems.append(item) }
         }
         // Separate: one key and one input source that is neither Korean nor English.
         keyPicker.removeAllItems(); keyPicker.addItem(withTitle: "선택 안 함")
@@ -488,8 +492,13 @@ final class AddedSourcesSettings: NSObject {
             : engine.keyboards.result.extraBlocked > 0 ? "\(engine.separateTarget.name)이 다른 키 매핑에서 사용 중이라 전환 키를 적용하지 못했습니다." : "")
         warning.isHidden = warning.stringValue.isEmpty
     }
+    func showEnglishIcon(_ image: NSImage) {
+        for icon in englishIcons where icon.image !== image { icon.image = image }
+        for item in englishItems where item.image !== image { item.image = image }
+    }
     private func cycleRow(_ id: String, source: InputSourceIdentity?, index: Int, count: Int, usable: Bool) -> NSView {
         let icon = NSImageView(image: source.map(owner.sourceIcon) ?? owner.badgeImage(label: sourceBadgeLabel("", position: index + 1), filled: false))
+        if source.map(isEnglish) == true { englishIcons.append(icon) }
         icon.contentTintColor = source == nil || !usable ? .disabledControlTextColor : .labelColor
         icon.widthAnchor.constraint(equalToConstant: 22).isActive = true; icon.heightAnchor.constraint(equalToConstant: 20).isActive = true
         let name = NSTextField(labelWithString: AppDelegate.sourceTitle(id))

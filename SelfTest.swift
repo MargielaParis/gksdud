@@ -105,14 +105,13 @@ func runSelfTest() {
             precondition(event.getIntegerValueField(.eventSourceUserData) == 12345)
         }
         precondition(nativeSwitchPulse(from: up, marker: 12345) == nil)
-        // The lock rides along, so a pulse leaves the session's Caps Lock as it is.
-        original.flags = [.maskShift, .maskAlphaShift, .maskSecondaryFn]
-        let locked = nativeSwitchPulse(from: original, marker: 12345)!
-        precondition(locked.0.flags == [.maskSecondaryFn, .maskAlphaShift] && locked.1.flags == [.maskSecondaryFn, .maskAlphaShift])
     }
+    // Sent with the lock as it is then, so a pulse leaves the session's Caps Lock alone.
+    precondition(pulseFlags(.maskSecondaryFn, caps: true) == [.maskSecondaryFn, .maskAlphaShift]
+        && pulseFlags([.maskSecondaryFn, .maskAlphaShift], caps: false) == .maskSecondaryFn)
     let textKey = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)!
     precondition(nativeSwitchPulse(from: textKey, marker: 12345) == nil, "Never synthesize ordinary typing")
-    print("PASS: F13-F20 native down/up pairs, marker, modifier isolation with Caps Lock kept, original event preservation, text-key rejection")
+    print("PASS: F13-F20 native down/up pairs, marker, modifier isolation, Caps Lock as sent, original event preservation, text-key rejection")
     var gate = PressGate()
     let press = gate.handle(code: 80, down: true, repeatKey: false, active: true, target: 80)
     precondition(press.consume && press.switchNow)
